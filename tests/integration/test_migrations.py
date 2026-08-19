@@ -1793,6 +1793,69 @@ async def test_stamped_merge_rollup_repair_downgrade_preserves_schema(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_quota_warmup_claim_expiry_migration_upgrade_and_downgrade(tmp_path):
+    from alembic import command
+    from sqlalchemy import inspect as sa_inspect
+
+    from app.db.migrate import _build_alembic_config
+
+    db_url = f"sqlite+aiosqlite:///{tmp_path / 'quota-warmup-claim-expiry.sqlite'}"
+    parent_revision = "20260806_020000_add_usage_history_bulk_covering_indexes"
+    claim_revision = "20260806_030000_add_quota_warmup_claim_expiry"
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, parent_revision, bootstrap_legacy=False))
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.begin() as conn:
+            await conn.execute(
+                text(
+                    """
+                    INSERT INTO quota_planner_decisions (
+                        id, mode, action, account_id, scheduled_at, executed_at,
+                        score, reason, forecast_snapshot_hash, state_before_json,
+                        state_after_json, status, idempotency_key, created_at
+                    ) VALUES (
+                        'warmup-legacy-executing', 'auto', 'warmup', 'acc-legacy', NULL, NULL,
+                        0.0, 'legacy_executing', NULL, NULL,
+                        NULL, 'executing', 'legacy-warmup-claim', CURRENT_TIMESTAMP
+                    )
+                    """
+                )
+            )
+    finally:
+        await engine.dispose()
+
+    await to_thread.run_sync(lambda: run_upgrade(db_url, claim_revision, bootstrap_legacy=False))
+
+    engine = create_async_engine(db_url, future=True)
+    try:
+        async with engine.connect() as conn:
+            columns = await conn.run_sync(
+                lambda sync_conn: {
+                    column["name"] for column in sa_inspect(sync_conn).get_columns("quota_planner_decisions")
+                }
+            )
+            lease_value = (
+                await conn.execute(
+                    text("SELECT lease_expires_at FROM quota_planner_decisions WHERE id = 'warmup-legacy-executing'")
+                )
+            ).scalar_one()
+        assert "lease_expires_at" in columns
+        assert lease_value is not None
+
+        await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent_revision))
+        async with engine.connect() as conn:
+            columns_after = await conn.run_sync(
+                lambda sync_conn: {
+                    column["name"] for column in sa_inspect(sync_conn).get_columns("quota_planner_decisions")
+                }
+            )
+        assert "lease_expires_at" not in columns_after
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.asyncio
 async def test_conversation_presence_rollup_migration_upgrade_and_downgrade(tmp_path):
     from alembic import command
     from sqlalchemy import inspect as sa_inspect
