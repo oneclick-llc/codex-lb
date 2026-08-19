@@ -2231,7 +2231,11 @@ def test_api_key_reasoning_policy_migration_round_trips_from_current_parent(tmp_
     config = _build_alembic_config(url)
     script_directory = ScriptDirectory.from_config(config)
     assert script_directory.get_revision(target_revision).down_revision == parent_revision
-    assert target_revision in script_directory.get_heads()
+    # Assert reachability from the single head rather than "is the head": every
+    # later migration would otherwise have to edit this test.
+    heads = script_directory.get_heads()
+    assert len(heads) == 1
+    assert target_revision in {revision.revision for revision in script_directory.iterate_revisions(heads[0], "base")}
 
     engine = create_engine(to_sync_database_url(url))
     try:
