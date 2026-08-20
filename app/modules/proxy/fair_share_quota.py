@@ -15,8 +15,10 @@ and rows without API-key attribution are excluded; the denominator is the total
 attributed pool consumption of the window.
 
 Classification is admission-time only and cached per replica; the classifier
-never writes. On read failure it fails open (no degradation) so a broken
-rollup read can never block foreground traffic.
+never writes. Lookups are non-blocking (stale results serve while a
+single-flight background refresh runs) and a failed refresh fails open by
+dropping all degradations, so a broken or slow rollup read can never block or
+throttle foreground traffic.
 """
 
 from __future__ import annotations
@@ -158,58 +160,68 @@ async def _fast_window_cost_by_key(session: AsyncSession) -> dict[str, float]:
 
 
 class FairShareQuotaClassifier:
-    """Per-replica cached over-share classification (single-flight refresh)."""
+    """Per-replica cached over-share classification.
+
+    Lookups never block admission: a stale or missing snapshot schedules a
+    single-flight background refresh and the lookup answers from what is
+    already known (no degradation while nothing is known yet). A failed
+    refresh fails open — degradations are dropped, not extended — and is
+    retried after the cache TTL.
+    """
 
     def __init__(self, *, cache_ttl_seconds: float = CACHE_TTL_SECONDS) -> None:
         self._cache_ttl_seconds = cache_ttl_seconds
         self._snapshot: FairShareQuotaSnapshot | None = None
-        self._lock = asyncio.Lock()
+        self._refresh_task: asyncio.Task[None] | None = None
 
     async def is_over_share(self, api_key_id: str) -> bool:
-        snapshot = await self._get_snapshot()
+        snapshot = self._snapshot
+        if snapshot is None or time.monotonic() - snapshot.computed_monotonic >= self._cache_ttl_seconds:
+            self._schedule_refresh()
         if snapshot is None:
             return False
         return api_key_id in snapshot.over_share_key_ids
 
-    async def _get_snapshot(self) -> FairShareQuotaSnapshot | None:
-        snapshot = self._snapshot
-        if snapshot is not None and time.monotonic() - snapshot.computed_monotonic < self._cache_ttl_seconds:
-            return snapshot
-        async with self._lock:
-            snapshot = self._snapshot
-            if snapshot is not None and time.monotonic() - snapshot.computed_monotonic < self._cache_ttl_seconds:
-                return snapshot
-            previously_over = snapshot.over_share_key_ids if snapshot is not None else frozenset()
-            try:
-                async with get_background_session() as session:
-                    active_key_ids = await _active_foreground_key_ids(session)
-                    long_costs = await _long_window_cost_by_key(session)
-                    fast_costs = await _fast_window_cost_by_key(session)
-            except Exception:
-                # Fail open: a broken usage read must never block foreground
-                # admission. Keep the stale snapshot if one exists.
-                logger.warning("Fair-share quota classification refresh failed", exc_info=True)
-                if self._snapshot is not None:
-                    self._snapshot = FairShareQuotaSnapshot(
-                        over_share_key_ids=self._snapshot.over_share_key_ids,
-                        active_foreground_key_count=self._snapshot.active_foreground_key_count,
-                        computed_monotonic=time.monotonic(),
-                    )
-                return self._snapshot
-            over_share = classify_over_share(
-                active_key_ids=active_key_ids,
-                long_costs=long_costs,
-                fast_costs=fast_costs,
-                previously_over=previously_over,
+    def _schedule_refresh(self) -> None:
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return
+        self._refresh_task = asyncio.get_running_loop().create_task(self.refresh())
+
+    async def refresh(self) -> None:
+        """Recompute the snapshot once (background-task and test entry point)."""
+        previous = self._snapshot
+        previously_over = previous.over_share_key_ids if previous is not None else frozenset()
+        try:
+            async with get_background_session() as session:
+                active_key_ids = await _active_foreground_key_ids(session)
+                long_costs = await _long_window_cost_by_key(session)
+                fast_costs = await _fast_window_cost_by_key(session)
+        except Exception:
+            # Fail open: a broken usage read must never keep foreground keys
+            # degraded. Drop degradations; the next scheduled refresh (after
+            # the cache TTL) restores classification once reads recover.
+            logger.warning("Fair-share quota classification refresh failed; failing open", exc_info=True)
+            self._set_snapshot(
+                frozenset(),
+                previous.active_foreground_key_count if previous is not None else 0,
             )
-            self._snapshot = FairShareQuotaSnapshot(
-                over_share_key_ids=over_share,
-                active_foreground_key_count=len(active_key_ids),
-                computed_monotonic=time.monotonic(),
-            )
-            if PROMETHEUS_AVAILABLE and fair_share_quota_over_share_keys is not None:
-                fair_share_quota_over_share_keys.set(len(over_share))
-            return self._snapshot
+            return
+        over_share = classify_over_share(
+            active_key_ids=active_key_ids,
+            long_costs=long_costs,
+            fast_costs=fast_costs,
+            previously_over=previously_over,
+        )
+        self._set_snapshot(over_share, len(active_key_ids))
+
+    def _set_snapshot(self, over_share: frozenset[str], active_key_count: int) -> None:
+        self._snapshot = FairShareQuotaSnapshot(
+            over_share_key_ids=over_share,
+            active_foreground_key_count=active_key_count,
+            computed_monotonic=time.monotonic(),
+        )
+        if PROMETHEUS_AVAILABLE and fair_share_quota_over_share_keys is not None:
+            fair_share_quota_over_share_keys.set(len(over_share))
 
 
 _classifier: FairShareQuotaClassifier | None = None

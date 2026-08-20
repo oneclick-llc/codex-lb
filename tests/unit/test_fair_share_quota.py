@@ -150,7 +150,7 @@ class TestClassifierCache:
         monkeypatch.setattr(fair_share_quota, "_fast_window_cost_by_key", _fast)
 
     @pytest.mark.asyncio
-    async def test_classifies_and_caches_within_ttl(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_refresh_classifies_and_lookup_serves_cached(self, monkeypatch: pytest.MonkeyPatch) -> None:
         calls: list[str] = []
         self._stub_queries(
             monkeypatch,
@@ -160,12 +160,34 @@ class TestClassifierCache:
             calls=calls,
         )
         classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+        await classifier.refresh()
         assert await classifier.is_over_share("a") is True
         assert await classifier.is_over_share("b") is False
         assert calls == ["refresh"]
 
     @pytest.mark.asyncio
-    async def test_expired_cache_recomputes_with_hysteresis(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_lookup_never_blocks_and_schedules_single_flight_refresh(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        self._stub_queries(
+            monkeypatch,
+            active={"a", "b", "c"},
+            long_costs={"a": 80.0, "b": 10.0, "c": 10.0},
+            fast_costs={},
+        )
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+        # Cold lookup answers immediately (no degradation) and schedules one
+        # background refresh; a second lookup reuses the in-flight task.
+        assert await classifier.is_over_share("a") is False
+        task = classifier._refresh_task
+        assert task is not None and not task.done()
+        assert await classifier.is_over_share("a") is False
+        assert classifier._refresh_task is task
+        await task
+        assert await classifier.is_over_share("a") is True
+
+    @pytest.mark.asyncio
+    async def test_stale_snapshot_serves_while_revalidating(self, monkeypatch: pytest.MonkeyPatch) -> None:
         classifier = FairShareQuotaClassifier(cache_ttl_seconds=0.0)
         self._stub_queries(
             monkeypatch,
@@ -173,6 +195,30 @@ class TestClassifierCache:
             long_costs={"a": 80.0, "b": 10.0, "c": 10.0},
             fast_costs={},
         )
+        await classifier.refresh()
+        self._stub_queries(
+            monkeypatch,
+            active={"a", "b", "c"},
+            long_costs={"a": 20.0, "b": 40.0, "c": 40.0},
+            fast_costs={},
+        )
+        # Expired snapshot still answers instantly with the stale verdict.
+        assert await classifier.is_over_share("a") is True
+        task = classifier._refresh_task
+        assert task is not None
+        await task
+        assert await classifier.is_over_share("a") is False
+
+    @pytest.mark.asyncio
+    async def test_hysteresis_across_refreshes(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+        self._stub_queries(
+            monkeypatch,
+            active={"a", "b", "c"},
+            long_costs={"a": 80.0, "b": 10.0, "c": 10.0},
+            fast_costs={},
+        )
+        await classifier.refresh()
         assert await classifier.is_over_share("a") is True
         # Drop to 35%: between exit and enter, so the prior degradation holds.
         self._stub_queries(
@@ -181,6 +227,7 @@ class TestClassifierCache:
             long_costs={"a": 35.0, "b": 33.0, "c": 32.0},
             fast_costs={},
         )
+        await classifier.refresh()
         assert await classifier.is_over_share("a") is True
         # Back at fair share: restored.
         self._stub_queries(
@@ -189,33 +236,38 @@ class TestClassifierCache:
             long_costs={"a": 33.0, "b": 34.0, "c": 33.0},
             fast_costs={},
         )
+        await classifier.refresh()
         assert await classifier.is_over_share("a") is False
 
     @pytest.mark.asyncio
-    async def test_read_failure_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_refresh_failure_fails_open(self, monkeypatch: pytest.MonkeyPatch) -> None:
         async def _boom(_session):
             raise RuntimeError("rollup read failed")
 
         monkeypatch.setattr(fair_share_quota, "_active_foreground_key_ids", _boom)
         classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+        await classifier.refresh()
         assert await classifier.is_over_share("a") is False
 
     @pytest.mark.asyncio
-    async def test_read_failure_keeps_stale_snapshot(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        classifier = FairShareQuotaClassifier(cache_ttl_seconds=0.0)
+    async def test_refresh_failure_drops_stale_degradations(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
         self._stub_queries(
             monkeypatch,
             active={"a", "b", "c"},
             long_costs={"a": 80.0, "b": 10.0, "c": 10.0},
             fast_costs={},
         )
+        await classifier.refresh()
         assert await classifier.is_over_share("a") is True
 
         async def _boom(_session):
             raise RuntimeError("rollup read failed")
 
         monkeypatch.setattr(fair_share_quota, "_active_foreground_key_ids", _boom)
-        assert await classifier.is_over_share("a") is True
+        await classifier.refresh()
+        # A broken read must not keep the key degraded.
+        assert await classifier.is_over_share("a") is False
 
 
 class TestResolveEffectiveTrafficClass:

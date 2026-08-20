@@ -37,6 +37,7 @@ async def test_fair_share_quota_migration_upgrade_defaults_and_downgrade(tmp_pat
         await to_thread.run_sync(lambda: run_upgrade(db_url, revision, bootstrap_legacy=False))
         columns, rows = await column_and_rows(engine)
         assert column in columns
+        assert rows, "expected a seeded dashboard_settings row at the parent revision"
         assert all(row == (0,) for row in rows)
 
         await to_thread.run_sync(lambda: command.downgrade(_build_alembic_config(db_url), parent))
