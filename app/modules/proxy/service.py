@@ -20,7 +20,6 @@ from app.core.auth.refresh import (
 from app.core.balancer import (
     PERMANENT_FAILURE_CODES,
     TRAFFIC_CLASS_FOREGROUND,
-    TRAFFIC_CLASS_OPPORTUNISTIC,
     ResetPreferenceWindow,
     RoutingStrategy,
     TrafficClass,
@@ -728,6 +727,7 @@ from app.modules.proxy.durable_bridge_coordinator import (
 from app.modules.proxy.durable_bridge_coordinator import (
     DurableBridgeSessionCoordinator,
 )
+from app.modules.proxy.fair_share_quota import resolve_effective_traffic_class
 from app.modules.proxy.helpers import (
     _apply_error_metadata,
     _header_account_id,
@@ -1025,9 +1025,7 @@ class ProxyService(
                 account = await self._select_codex_control_account_without_budget(
                     affinity=affinity,
                     api_key=api_key,
-                    traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC
-                    if api_key is not None and api_key.traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC
-                    else TRAFFIC_CLASS_FOREGROUND,
+                    traffic_class=await resolve_effective_traffic_class(api_key),
                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                 )
                 if account is None:
@@ -1737,11 +1735,7 @@ class ProxyService(
             if api_key is not None and api_key.account_assignment_scope_enabled
             else None
         )
-        effective_traffic_class = (
-            TRAFFIC_CLASS_OPPORTUNISTIC
-            if api_key is not None and api_key.traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC
-            else traffic_class
-        )
+        effective_traffic_class = await resolve_effective_traffic_class(api_key, requested=traffic_class)
         excluded_account_ids_set = set(exclude_account_ids or ())
 
         def log_account_id(account_id: str | None) -> str | None:

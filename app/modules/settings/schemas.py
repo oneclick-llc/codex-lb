@@ -40,6 +40,7 @@ class DashboardSettingsResponse(DashboardModel):
     proxy_account_stream_limit: int = Field(ge=0)
     proxy_account_stream_recovery_reserve: int = Field(ge=0)
     proxy_api_key_fair_share_congestion_threshold_pct: int = Field(ge=0, le=100)
+    fair_share_quota_mode_enabled: bool
     upstream_proxy_routing_enabled: bool
     upstream_proxy_default_pool_id: str | None = None
     prefer_earlier_reset_accounts: bool
@@ -104,6 +105,7 @@ class DashboardSettingsUpdateRequest(DashboardModel):
     proxy_account_stream_limit: int | None = Field(default=None, ge=0)
     proxy_account_stream_recovery_reserve: int | None = Field(default=None, ge=0)
     proxy_api_key_fair_share_congestion_threshold_pct: int | None = Field(default=None, ge=0, le=100)
+    fair_share_quota_mode_enabled: bool | None = None
     upstream_proxy_routing_enabled: bool | None = None
     upstream_proxy_default_pool_id: str | None = None
     prefer_earlier_reset_accounts: bool | None = None

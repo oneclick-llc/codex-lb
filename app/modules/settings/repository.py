@@ -37,6 +37,7 @@ class SettingsRepository:
             proxy_api_key_fair_share_congestion_threshold_pct=(
                 get_settings().proxy_api_key_fair_share_congestion_threshold_pct
             ),
+            fair_share_quota_mode_enabled=False,
             upstream_proxy_routing_enabled=False,
             upstream_proxy_default_pool_id=None,
             prefer_earlier_reset_accounts=True,
@@ -102,6 +103,7 @@ class SettingsRepository:
         proxy_account_stream_limit: int | None = None,
         proxy_account_stream_recovery_reserve: int | None = None,
         proxy_api_key_fair_share_congestion_threshold_pct: int | None = None,
+        fair_share_quota_mode_enabled: bool | None = None,
         upstream_proxy_routing_enabled: bool | None = None,
         upstream_proxy_default_pool_id: str | None = None,
         prefer_earlier_reset_accounts: bool | None = None,
@@ -178,6 +180,8 @@ class SettingsRepository:
         if upstream_proxy_routing_enabled is not None:
             settings.upstream_proxy_routing_enabled = upstream_proxy_routing_enabled
         settings.upstream_proxy_default_pool_id = upstream_proxy_default_pool_id or None
+        if fair_share_quota_mode_enabled is not None:
+            settings.fair_share_quota_mode_enabled = fair_share_quota_mode_enabled
         if prefer_earlier_reset_accounts is not None:
             settings.prefer_earlier_reset_accounts = prefer_earlier_reset_accounts
         if prefer_earlier_reset_window is not None:

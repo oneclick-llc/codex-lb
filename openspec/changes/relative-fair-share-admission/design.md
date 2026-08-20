@@ -26,7 +26,7 @@ One codex-lb deployment serves a team through per-user API keys against a shared
 5. **Enforcement reuses the opportunistic path wholesale.** An effective-traffic-class resolution (static `traffic_class`, else degraded classification when the mode is on) feeds the existing `check_opportunistic_admission` gate, thresholds (`sticky reallocation budget thresholds`), denial envelopes (`429 rate_limit_exceeded` + `Retry-After`, `usage_limit_reached` + `resets_at`), and metrics style. No new admission machinery.
 6. **Classification is admission-time only.** In-flight turns and established streams are never reclassified mid-turn; the next admission decision uses the current class.
 7. **Per-replica cached classification, no leader election.** Shares are computed from read-only queries and cached in-process (TTL <= 60s). Replicas may briefly disagree; the consequence is only which admission path a request takes, never double-settlement.
-8. **Composition order.** Explicit `ApiKeyLimit` enforcement (reserve/settle) runs first and is unchanged; fair-share classification applies after. Explicit `traffic_class: opportunistic` keys are always opportunistic regardless of share. Existing per-key concurrency fair share operates independently.
+8. **Composition.** Explicit `ApiKeyLimit` enforcement (reserve/settle) is unchanged and binds independently — in the request flow the admission gate runs before limit reservation, and classification can never admit a request past a configured hard limit. Explicit `traffic_class: opportunistic` keys are always opportunistic regardless of share. Existing per-key concurrency fair share operates independently.
 9. **Default off.** With the toggle off, behavior is byte-identical to today.
 
 ## Risks / Trade-offs

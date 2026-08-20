@@ -80,6 +80,7 @@ export const DashboardSettingsSchema = z
     proxyAccountStreamLimit: z.number().int().min(0).optional().default(8),
     proxyAccountStreamRecoveryReserve: z.number().int().min(0).optional().default(1),
     proxyApiKeyFairShareCongestionThresholdPct: z.number().int().min(0).max(100).optional().default(0),
+    fairShareQuotaModeEnabled: z.boolean().optional().default(false),
     openaiCacheAffinityMaxAgeSeconds: z
       .number()
       .int()
@@ -184,6 +185,7 @@ export const SettingsUpdateRequestSchema = z
     proxyAccountStreamLimit: z.number().int().min(0).optional(),
     proxyAccountStreamRecoveryReserve: z.number().int().min(0).optional(),
     proxyApiKeyFairShareCongestionThresholdPct: z.number().int().min(0).max(100).optional(),
+    fairShareQuotaModeEnabled: z.boolean().optional(),
     openaiCacheAffinityMaxAgeSeconds: z.number().int().positive().optional(),
     dashboardSessionTtlSeconds: z.number().int().min(3600).optional(),
     stickyReallocationBudgetThresholdPct: z.number().min(0).max(100).optional(),

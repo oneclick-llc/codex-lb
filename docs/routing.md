@@ -43,10 +43,16 @@ Account pages display each window as **percent remaining**; the sticky reallocat
 
 When enabled and several accounts are otherwise eligible, selection is restricted to the accounts whose selected quota window (5h or weekly) resets soonest. Weekly resets are compared in whole-day buckets; when the selected window has no known reset time, the other window is used as a fallback. The preference applies to the `Capacity weighted`, `Usage weighted`, and `Fill first` strategies; the fixed-order and draw-based strategies (`Round robin`, `Relative availability`, `Sequential drain`, `Reset drain`, `Single account`) ignore it.
 
+### Fair-share quota mode
+
+Off by default. When enabled (Settings → Routing → **Fair-share quota mode**), every active foreground API key is classified by its share of the pool's actual cost consumption over a rolling 7-day window plus a 1-hour burst window. A key consuming more than ~1.2× its fair share (`1/N` of pooled consumption, where `N` is the number of active foreground keys) is temporarily admitted only into **safe quota headroom** — the same admission path as `opportunistic` keys — until its share falls back to `1/N`. Keys under their share are unaffected, and while the pool is uncontended nobody is throttled.
+
+There is nothing to configure per key: adding a team member is just creating a key, and `1/N` adjusts automatically. Explicit per-key limits and `traffic_class: opportunistic` keys keep their existing behavior and compose with the mode (hard limits are enforced first). Over-share keys denied at a closed burn window receive the standard `429 rate_limit_exceeded` response with `Retry-After`, so retrying clients degrade gracefully.
+
 ### Limit warm-up
 
 Limit warm-up sends **one small real request** (using the configured warm-up model and prompt) to an opted-in account when one of its quota windows is confirmed to have newly reset, verifying that the account responds. It consumes a small amount of quota. The optional staggered idle mode additionally pre-starts the 5h window of idle opted-in accounts before traffic arrives; the configured cooldown applies to these staggered idle probes, while ordinary reset-confirmed probes fire once per confirmed reset. Accounts opt in individually (`Enable warm-up` in account actions); the last attempt's result, model, and time are shown on the account list entry.
 
 ---
 
-*Specs: [account-routing](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/account-routing) · [frontend-architecture](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/frontend-architecture) · [usage-refresh-policy](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/usage-refresh-policy)*
+*Specs: [account-routing](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/account-routing) · [proxy-admission-control](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/proxy-admission-control) · [frontend-architecture](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/frontend-architecture) · [usage-refresh-policy](https://github.com/Soju06/codex-lb/tree/main/openspec/specs/usage-refresh-policy)*

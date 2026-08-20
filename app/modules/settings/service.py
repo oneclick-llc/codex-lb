@@ -21,6 +21,7 @@ class DashboardSettingsData:
     proxy_account_stream_limit: int
     proxy_account_stream_recovery_reserve: int
     proxy_api_key_fair_share_congestion_threshold_pct: int
+    fair_share_quota_mode_enabled: bool
     upstream_proxy_routing_enabled: bool
     upstream_proxy_default_pool_id: str | None
     prefer_earlier_reset_accounts: bool
@@ -76,6 +77,7 @@ class DashboardSettingsUpdateData:
     proxy_account_stream_limit: int | None
     proxy_account_stream_recovery_reserve: int | None
     proxy_api_key_fair_share_congestion_threshold_pct: int | None
+    fair_share_quota_mode_enabled: bool
     upstream_proxy_routing_enabled: bool
     upstream_proxy_default_pool_id: str | None
     prefer_earlier_reset_accounts: bool
@@ -141,6 +143,7 @@ class SettingsService:
             proxy_api_key_fair_share_congestion_threshold_pct=_effective_api_key_fair_share_threshold_pct(
                 row.proxy_api_key_fair_share_congestion_threshold_pct
             ),
+            fair_share_quota_mode_enabled=row.fair_share_quota_mode_enabled,
             upstream_proxy_routing_enabled=row.upstream_proxy_routing_enabled,
             upstream_proxy_default_pool_id=row.upstream_proxy_default_pool_id,
             prefer_earlier_reset_accounts=row.prefer_earlier_reset_accounts,
@@ -211,6 +214,7 @@ class SettingsService:
             proxy_api_key_fair_share_congestion_threshold_pct=(
                 payload.proxy_api_key_fair_share_congestion_threshold_pct
             ),
+            fair_share_quota_mode_enabled=payload.fair_share_quota_mode_enabled,
             upstream_proxy_routing_enabled=payload.upstream_proxy_routing_enabled,
             upstream_proxy_default_pool_id=payload.upstream_proxy_default_pool_id,
             prefer_earlier_reset_accounts=payload.prefer_earlier_reset_accounts,
@@ -271,6 +275,7 @@ class SettingsService:
             proxy_api_key_fair_share_congestion_threshold_pct=_effective_api_key_fair_share_threshold_pct(
                 row.proxy_api_key_fair_share_congestion_threshold_pct
             ),
+            fair_share_quota_mode_enabled=row.fair_share_quota_mode_enabled,
             upstream_proxy_routing_enabled=row.upstream_proxy_routing_enabled,
             upstream_proxy_default_pool_id=row.upstream_proxy_default_pool_id,
             prefer_earlier_reset_accounts=row.prefer_earlier_reset_accounts,

@@ -13,6 +13,7 @@ export function buildSettingsUpdateRequest(
     upstreamStreamTransport: settings.upstreamStreamTransport,
     prohibitFastMode: settings.prohibitFastMode,
     httpDownstreamTransportPolicy: settings.httpDownstreamTransportPolicy,
+    fairShareQuotaModeEnabled: settings.fairShareQuotaModeEnabled,
     preferEarlierResetAccounts: settings.preferEarlierResetAccounts,
     preferEarlierResetWindow: settings.preferEarlierResetWindow,
     showResetCreditBadges: settings.showResetCreditBadges,

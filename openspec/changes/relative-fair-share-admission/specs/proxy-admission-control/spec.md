@@ -8,7 +8,7 @@ Classification SHALL use per-key `cost_usd` attribution from the request usage h
 
 Degraded admission SHALL reuse the existing opportunistic gate semantics unchanged: the same budget-threshold resolution, the same `429` `rate_limit_exceeded` envelope with `Retry-After` when the burn window is closed, and the same `usage_limit_reached` envelope with `resets_at` when the pool is exhausted. Classification SHALL apply at admission time only; in-flight turns SHALL NOT be reclassified.
 
-The mode SHALL NOT alter: explicit `traffic_class: opportunistic` keys (always opportunistic), explicit `ApiKeyLimit` enforcement (evaluated first, unchanged), or the per-API-key concurrent-stream fair share. With the setting disabled (the default), admission behavior SHALL be identical to the mode not existing.
+The mode SHALL NOT alter: explicit `traffic_class: opportunistic` keys (always opportunistic), explicit `ApiKeyLimit` enforcement (unchanged and still binding — classification can never admit a request past a configured hard limit), or the per-API-key concurrent-stream fair share. With the setting disabled (the default), admission behavior SHALL be identical to the mode not existing.
 
 #### Scenario: Mode is off by default
 
@@ -43,12 +43,12 @@ The mode SHALL NOT alter: explicit `traffic_class: opportunistic` keys (always o
 - **WHEN** that key's consumption share is below its fair share
 - **THEN** the key remains subject to opportunistic admission (fair-share classification never promotes it to foreground)
 
-#### Scenario: Explicit API key limits keep precedence
+#### Scenario: Explicit API key limits remain binding
 
 - **GIVEN** the mode is enabled and a key has an explicit `ApiKeyLimit`
-- **WHEN** the key exceeds that limit
+- **WHEN** the key exceeds that limit and its request passes admission
 - **THEN** the request is rejected by limit enforcement exactly as with the mode disabled
-- **AND** fair-share classification is not consulted for that request
+- **AND** fair-share classification never admits a request past a configured hard limit
 
 #### Scenario: Restored key returns to foreground admission
 

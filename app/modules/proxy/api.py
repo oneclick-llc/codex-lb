@@ -234,6 +234,7 @@ from app.modules.proxy._service.support import (
 )
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
+from app.modules.proxy.fair_share_quota import resolve_effective_traffic_class
 from app.modules.proxy.helpers import _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import parse_forwarded_request
 from app.modules.proxy.images_observability import (
@@ -7771,7 +7772,9 @@ async def _opportunistic_admission_denial(
     model: str | None,
     lease_kind: Literal["response_create", "stream"] | None = "stream",
 ) -> JSONResponse | None:
-    if api_key is None or api_key.traffic_class != TRAFFIC_CLASS_OPPORTUNISTIC:
+    if api_key is None:
+        return None
+    if await resolve_effective_traffic_class(api_key) != TRAFFIC_CLASS_OPPORTUNISTIC:
         return None
     selection = await context.service.check_opportunistic_admission(
         api_key=api_key,
