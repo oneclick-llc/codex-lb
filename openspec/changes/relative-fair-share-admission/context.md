@@ -26,8 +26,8 @@ On `/opsx:sync`, fold the "why relative shares" rationale above into
 "Relative fair-share quota admission" requirement. `docs/routing.md` already
 carries the operator-facing description and the capability link-back.
 
-## Verification caveat
+## Verification
 
-The `openspec` CLI was unavailable in the implementation environment; delta
-formatting mirrors `add-reset-credit-display-settings`. Run
-`openspec validate --specs` where the CLI exists before archiving.
+`openspec validate --specs` — 57 passed, 0 failed — and
+`openspec validate relative-fair-share-admission --strict` (change valid)
+were run with @fission-ai/openspec 1.10.0.
