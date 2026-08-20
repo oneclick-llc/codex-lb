@@ -271,4 +271,65 @@ describe("buildSettingsUpdateRequest", () => {
       proxyApiKeyFairShareCongestionThresholdPct: 80,
     });
   });
+
+  it("omits fairShareQuotaModeEnabled when the API response did not provide it", () => {
+    // Mixed-version rollout: GET served by an old replica without the field.
+    // An unrelated save must not write the schema default (false) back and
+    // silently disable an already-enabled mode.
+    const settings = DashboardSettingsSchema.parse({
+      stickyThreadsEnabled: true,
+      upstreamStreamTransport: "default",
+      preferEarlierResetAccounts: false,
+      routingStrategy: "round_robin",
+      openaiCacheAffinityMaxAgeSeconds: 300,
+      dashboardSessionTtlSeconds: 43200,
+      importWithoutOverwrite: true,
+      totpRequiredOnLogin: true,
+      totpConfigured: false,
+      apiKeyAuthEnabled: true,
+    });
+
+    const payload = buildSettingsUpdateRequest(settings, { stickyThreadsEnabled: false });
+
+    expect("fairShareQuotaModeEnabled" in payload).toBe(false);
+  });
+
+  it("keeps an explicit fairShareQuotaModeEnabled patch even without API presence", () => {
+    const settings = DashboardSettingsSchema.parse({
+      stickyThreadsEnabled: true,
+      upstreamStreamTransport: "default",
+      preferEarlierResetAccounts: false,
+      routingStrategy: "round_robin",
+      openaiCacheAffinityMaxAgeSeconds: 300,
+      dashboardSessionTtlSeconds: 43200,
+      importWithoutOverwrite: true,
+      totpRequiredOnLogin: true,
+      totpConfigured: false,
+      apiKeyAuthEnabled: true,
+    });
+
+    const payload = buildSettingsUpdateRequest(settings, { fairShareQuotaModeEnabled: true });
+
+    expect(payload.fairShareQuotaModeEnabled).toBe(true);
+  });
+
+  it("carries fairShareQuotaModeEnabled through when the API response provided it", () => {
+    const settings = DashboardSettingsSchema.parse({
+      stickyThreadsEnabled: true,
+      upstreamStreamTransport: "default",
+      preferEarlierResetAccounts: false,
+      routingStrategy: "round_robin",
+      openaiCacheAffinityMaxAgeSeconds: 300,
+      dashboardSessionTtlSeconds: 43200,
+      importWithoutOverwrite: true,
+      totpRequiredOnLogin: true,
+      totpConfigured: false,
+      apiKeyAuthEnabled: true,
+      fairShareQuotaModeEnabled: true,
+    });
+
+    const payload = buildSettingsUpdateRequest(settings, { stickyThreadsEnabled: false });
+
+    expect(payload.fairShareQuotaModeEnabled).toBe(true);
+  });
 });

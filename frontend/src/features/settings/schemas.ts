@@ -80,7 +80,9 @@ export const DashboardSettingsSchema = z
     proxyAccountStreamLimit: z.number().int().min(0).optional().default(8),
     proxyAccountStreamRecoveryReserve: z.number().int().min(0).optional().default(1),
     proxyApiKeyFairShareCongestionThresholdPct: z.number().int().min(0).max(100).optional().default(0),
-    fairShareQuotaModeEnabled: z.boolean().optional().default(false),
+    // No .default(): presence is tracked in the transform so a mixed-version
+    // rollout (GET served by an old replica) cannot silently write false back.
+    fairShareQuotaModeEnabled: z.boolean().optional(),
     openaiCacheAffinityMaxAgeSeconds: z
       .number()
       .int()
@@ -148,8 +150,11 @@ export const DashboardSettingsSchema = z
       settings.stickyReallocationPrimaryBudgetThresholdPct ??
       settings.stickyReallocationBudgetThresholdPct ??
       95;
+    const fairShareQuotaModeProvided = settings.fairShareQuotaModeEnabled !== undefined;
     return {
       ...settings,
+      fairShareQuotaModeEnabled: settings.fairShareQuotaModeEnabled ?? false,
+      __fairShareQuotaModeEnabledProvided: fairShareQuotaModeProvided,
       stickyReallocationBudgetThresholdPct:
         settings.stickyReallocationBudgetThresholdPct ?? primaryThreshold,
       stickyReallocationPrimaryBudgetThresholdPct: primaryThreshold,

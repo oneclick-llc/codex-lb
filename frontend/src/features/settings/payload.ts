@@ -52,6 +52,12 @@ export function buildSettingsUpdateRequest(
     delete payload.expectedVersion;
   }
   if (
+    settings.__fairShareQuotaModeEnabledProvided === false &&
+    !("fairShareQuotaModeEnabled" in patch)
+  ) {
+    delete payload.fairShareQuotaModeEnabled;
+  }
+  if (
     (payload.stickyReallocationBudgetThresholdPct === undefined ||
       settings.__stickyReallocationBudgetThresholdPctProvided === false) &&
     !("stickyReallocationBudgetThresholdPct" in patch)
