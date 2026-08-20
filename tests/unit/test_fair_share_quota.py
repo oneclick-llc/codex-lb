@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
@@ -250,6 +251,37 @@ class TestClassifierCache:
         assert await classifier.is_over_share("a") is False
 
     @pytest.mark.asyncio
+    async def test_hung_refresh_times_out_fails_open_and_releases_single_flight(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+        self._stub_queries(
+            monkeypatch,
+            active={"a", "b", "c"},
+            long_costs={"a": 80.0, "b": 10.0, "c": 10.0},
+            fast_costs={},
+        )
+        await classifier.refresh()
+        assert await classifier.is_over_share("a") is True
+
+        async def _hang(_session):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(fair_share_quota, "_active_foreground_key_ids", _hang)
+        monkeypatch.setattr(fair_share_quota, "REFRESH_TIMEOUT_SECONDS", 0.01)
+        # A hung read times out and fails open (degradations dropped)...
+        await classifier.refresh()
+        assert await classifier.is_over_share("a") is False
+        # ...and a scheduled background refresh finishes via the timeout too,
+        # releasing the single-flight slot instead of pinning it forever.
+        classifier._snapshot = None
+        assert await classifier.is_over_share("a") is False
+        task = classifier._refresh_task
+        assert task is not None
+        await task
+        assert task.done()
+
+    @pytest.mark.asyncio
     async def test_refresh_failure_drops_stale_degradations(self, monkeypatch: pytest.MonkeyPatch) -> None:
         classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
         self._stub_queries(
@@ -284,7 +316,7 @@ class TestResolveEffectiveTrafficClass:
         monkeypatch.setattr(
             fair_share_quota,
             "get_fair_share_quota_classifier",
-            lambda: SimpleNamespace(is_over_share=_is_over_share),
+            lambda: SimpleNamespace(is_over_share=_is_over_share, reset_if_populated=lambda: None),
         )
 
     @pytest.mark.asyncio
@@ -324,6 +356,20 @@ class TestResolveEffectiveTrafficClass:
         result = await resolve_effective_traffic_class(api_key, requested=TRAFFIC_CLASS_OPPORTUNISTIC)
         assert result == TRAFFIC_CLASS_OPPORTUNISTIC
 
+    @pytest.mark.asyncio
+    async def test_disabling_mode_resets_cached_classification(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+        classifier._set_snapshot(frozenset({"k1"}), 3)
+        monkeypatch.setattr(fair_share_quota, "get_fair_share_quota_classifier", lambda: classifier)
+
+        self._stub_settings(monkeypatch, enabled=True)
+        assert await resolve_effective_traffic_class(_make_api_key("k1")) == TRAFFIC_CLASS_OPPORTUNISTIC
+
+        self._stub_settings(monkeypatch, enabled=False)
+        assert await resolve_effective_traffic_class(_make_api_key("k1")) == TRAFFIC_CLASS_FOREGROUND
+        # The cached over-share verdict (and its gauge) is dropped, not kept.
+        assert classifier._snapshot is None
+
 
 class TestAdmissionRoutePath:
     """Degraded foreground keys flow through the opportunistic admission gate."""
@@ -339,7 +385,7 @@ class TestAdmissionRoutePath:
         monkeypatch.setattr(
             fair_share_quota,
             "get_fair_share_quota_classifier",
-            lambda: SimpleNamespace(is_over_share=_is_over_share),
+            lambda: SimpleNamespace(is_over_share=_is_over_share, reset_if_populated=lambda: None),
         )
 
     def _request(self) -> Request:

@@ -43,7 +43,7 @@ from app.core.utils.time import utcnow
 from app.db.models import ApiKey, RequestLog, RequestUsageHourlyRollup
 from app.db.session import get_background_session
 from app.modules.accounts.usage_time_rollup import WARMUP_REQUEST_KINDS, from_dimension, to_dimension
-from app.modules.accounts.usage_time_rollup_read import raw_windows_clause, read_hourly_window
+from app.modules.accounts.usage_time_rollup_read import raw_windows_clause, sum_hourly_cost_by_api_key_window
 from app.modules.api_keys.service import ApiKeyData
 
 logger = logging.getLogger(__name__)
@@ -54,6 +54,9 @@ FAST_WINDOW = timedelta(hours=1)
 ENTER_TOLERANCE = 1.2
 EXIT_TOLERANCE = 1.0
 CACHE_TTL_SECONDS = 60.0
+# A hung usage read must release the single-flight refresh instead of pinning
+# a stale over-share snapshot forever; timing out fails open like any error.
+REFRESH_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,7 +136,7 @@ async def _raw_cost_by_key(session: AsyncSession, windows) -> dict[str, float]:
 
 async def _long_window_cost_by_key(session: AsyncSession) -> dict[str, float]:
     since = utcnow() - LONG_WINDOW
-    rollup_rows, raw_windows = await read_hourly_window(
+    folded_costs, raw_windows = await sum_hourly_cost_by_api_key_window(
         session,
         since,
         None,
@@ -143,11 +146,11 @@ async def _long_window_cost_by_key(session: AsyncSession) -> dict[str, float]:
         ),
     )
     costs: dict[str, float] = {}
-    for rollup in rollup_rows:
-        key_id = from_dimension(rollup.api_key_id)
+    for encoded_key, cost in folded_costs.items():
+        key_id = from_dimension(encoded_key)
         if key_id is None:
             continue
-        costs[key_id] = costs.get(key_id, 0.0) + float(rollup.cost_usd or 0.0)
+        costs[key_id] = costs.get(key_id, 0.0) + cost
     if raw_windows:
         for key_id, cost in (await _raw_cost_by_key(session, raw_windows)).items():
             costs[key_id] = costs.get(key_id, 0.0) + cost
@@ -192,10 +195,11 @@ class FairShareQuotaClassifier:
         previous = self._snapshot
         previously_over = previous.over_share_key_ids if previous is not None else frozenset()
         try:
-            async with get_background_session() as session:
-                active_key_ids = await _active_foreground_key_ids(session)
-                long_costs = await _long_window_cost_by_key(session)
-                fast_costs = await _fast_window_cost_by_key(session)
+            async with asyncio.timeout(REFRESH_TIMEOUT_SECONDS):
+                async with get_background_session() as session:
+                    active_key_ids = await _active_foreground_key_ids(session)
+                    long_costs = await _long_window_cost_by_key(session)
+                    fast_costs = await _fast_window_cost_by_key(session)
         except Exception:
             # Fail open: a broken usage read must never keep foreground keys
             # degraded. Drop degradations; the next scheduled refresh (after
@@ -213,6 +217,17 @@ class FairShareQuotaClassifier:
             previously_over=previously_over,
         )
         self._set_snapshot(over_share, len(active_key_ids))
+
+    def reset_if_populated(self) -> None:
+        """Drop cached classification and zero the gauge (mode turned off)."""
+        if self._refresh_task is not None and not self._refresh_task.done():
+            self._refresh_task.cancel()
+        self._refresh_task = None
+        if self._snapshot is None:
+            return
+        self._snapshot = None
+        if PROMETHEUS_AVAILABLE and fair_share_quota_over_share_keys is not None:
+            fair_share_quota_over_share_keys.set(0)
 
     def _set_snapshot(self, over_share: frozenset[str], active_key_count: int) -> None:
         self._snapshot = FairShareQuotaSnapshot(
@@ -260,6 +275,9 @@ async def resolve_effective_traffic_class(
         return TRAFFIC_CLASS_OPPORTUNISTIC
     settings = await get_settings_cache().get()
     if not settings.fair_share_quota_mode_enabled:
+        # Keep the gauge and cached verdicts honest after the mode is turned
+        # off; a no-op when nothing is cached.
+        get_fair_share_quota_classifier().reset_if_populated()
         return requested
     if await get_fair_share_quota_classifier().is_over_share(api_key.id):
         if PROMETHEUS_AVAILABLE and fair_share_quota_degradations_total is not None:
