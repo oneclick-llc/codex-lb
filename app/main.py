@@ -393,6 +393,7 @@ async def lifespan(app: FastAPI):
     from app.core.middleware.firewall_cache import get_firewall_ip_cache
     from app.core.upstream_proxy.cache import get_upstream_route_cache
     from app.modules.proxy.account_cache import get_account_selection_cache, get_routing_availability_cache
+    from app.modules.proxy.fair_share_quota import reset_fair_share_quota_classifier_if_mode_disabled
     from app.modules.rate_limit_reset_credits.store import get_rate_limit_reset_credits_store
 
     # The poller MUST be installed before the model scheduler starts: a first
@@ -415,6 +416,10 @@ async def lifespan(app: FastAPI):
         NAMESPACE_SETTINGS,
         lambda: get_settings_cache().invalidate(propagate=False),
     )
+    # Runs after the settings-cache drop above, so it reads the fresh row: an
+    # idle worker otherwise keeps stale fair-share verdicts and a non-zero
+    # livemax gauge after the mode is turned off.
+    cache_poller.on_invalidation(NAMESPACE_SETTINGS, reset_fair_share_quota_classifier_if_mode_disabled)
     cache_poller.on_invalidation(NAMESPACE_UPSTREAM_ROUTE, get_upstream_route_cache().clear)
     # The route resolver also reads the dashboard settings row (routing enabled
     # + default pool id), so settings bumps clear resolved routes as well.

@@ -375,6 +375,40 @@ class TestClassifierCache:
         assert await classifier.is_over_share("a") is False
 
 
+class TestSettingsInvalidationCallback:
+    def _stub_settings(self, monkeypatch: pytest.MonkeyPatch, *, enabled: bool) -> None:
+        async def _get():
+            return SimpleNamespace(fair_share_quota_mode_enabled=enabled)
+
+        monkeypatch.setattr(fair_share_quota, "get_settings_cache", lambda: SimpleNamespace(get=_get))
+
+    @pytest.mark.asyncio
+    async def test_idle_worker_drops_snapshot_when_mode_turned_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # No admission request ever reaches this worker; only the settings bump does.
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+        classifier._set_snapshot(frozenset({"k1", "k2"}), 5)
+        monkeypatch.setattr(fair_share_quota, "get_fair_share_quota_classifier", lambda: classifier)
+        self._stub_settings(monkeypatch, enabled=False)
+
+        await fair_share_quota.reset_fair_share_quota_classifier_if_mode_disabled()
+
+        assert classifier._snapshot is None
+        if fair_share_quota.PROMETHEUS_AVAILABLE and fair_share_quota.fair_share_quota_over_share_keys is not None:
+            assert fair_share_quota.fair_share_quota_over_share_keys._value.get() == 0
+
+    @pytest.mark.asyncio
+    async def test_unrelated_settings_save_keeps_snapshot_while_mode_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+        classifier._set_snapshot(frozenset({"k1"}), 3)
+        monkeypatch.setattr(fair_share_quota, "get_fair_share_quota_classifier", lambda: classifier)
+        self._stub_settings(monkeypatch, enabled=True)
+
+        await fair_share_quota.reset_fair_share_quota_classifier_if_mode_disabled()
+
+        assert classifier._snapshot is not None
+        assert classifier._snapshot.over_share_key_ids == frozenset({"k1"})
+
+
 class TestResolveEffectiveTrafficClass:
     def _stub_settings(self, monkeypatch: pytest.MonkeyPatch, *, enabled: bool):
         async def _get():

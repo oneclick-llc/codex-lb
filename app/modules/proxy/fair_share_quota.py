@@ -274,6 +274,20 @@ def reset_fair_share_quota_classifier() -> None:
     _classifier = None
 
 
+async def reset_fair_share_quota_classifier_if_mode_disabled() -> None:
+    """Settings-invalidation callback (every replica, originator included).
+
+    The admission path resets the classifier when it sees the mode off, but a
+    worker that receives no proxy requests would keep its cached verdicts and a
+    non-zero livemax gauge indefinitely after the mode is turned off. Only the
+    disabled case resets: an unrelated settings save must not drop hysteresis
+    state while the mode is on.
+    """
+    settings = await get_settings_cache().get()
+    if not getattr(settings, "fair_share_quota_mode_enabled", False):
+        get_fair_share_quota_classifier().reset_if_populated()
+
+
 async def resolve_effective_traffic_class(
     api_key: ApiKeyData | None,
     *,
