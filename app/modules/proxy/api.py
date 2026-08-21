@@ -44,6 +44,7 @@ from app.core.auth.dependencies import (
     validate_usage_api_key,
 )
 from app.core.auth.refresh import RefreshError
+from app.core.balancer import TRAFFIC_CLASS_FAIR_SHARE_DEGRADED
 from app.core.cache.invalidation import NAMESPACE_RESET_CREDITS, bump_cache_invalidation_local
 from app.core.clients.files import FileProxyError
 from app.core.clients.proxy import (
@@ -234,7 +235,7 @@ from app.modules.proxy._service.support import (
 )
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
-from app.modules.proxy.fair_share_quota import resolve_effective_traffic_class
+from app.modules.proxy.fair_share_quota import fair_share_denial_detail, resolve_effective_traffic_class
 from app.modules.proxy.helpers import _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import parse_forwarded_request
 from app.modules.proxy.images_observability import (
@@ -7799,6 +7800,10 @@ async def _opportunistic_admission_denial(
     message = selection.error_message or "opportunistic burn window closed"
     if not message.startswith("opportunistic burn window closed"):
         message = f"opportunistic burn window closed: {message}"
+    if traffic_class == TRAFFIC_CLASS_FAIR_SHARE_DEGRADED:
+        detail = fair_share_denial_detail(api_key.id)
+        if detail is not None:
+            message = f"{message}; your key's share of pooled usage: {detail}"
     return _logged_error_json_response(
         request,
         429,

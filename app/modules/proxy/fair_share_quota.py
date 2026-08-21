@@ -30,7 +30,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from datetime import timedelta
 
 from sqlalchemy import func, or_, select
@@ -73,10 +74,40 @@ REFRESH_TIMEOUT_SECONDS = 30.0
 
 
 @dataclass(frozen=True, slots=True)
+class WindowShare:
+    """A key's fraction of one window's pooled spend, and the fair share it is
+    judged against (``None`` when the window classifies nobody: a lone
+    consumer or total spend below the noise floor)."""
+
+    share: float
+    fair: float | None
+
+
+@dataclass(frozen=True, slots=True)
+class KeyShares:
+    long: WindowShare
+    fast: WindowShare
+
+
+@dataclass(frozen=True, slots=True)
 class FairShareQuotaSnapshot:
     over_share_key_ids: frozenset[str]
     active_foreground_key_count: int
     computed_monotonic: float
+    shares: Mapping[str, KeyShares] = field(default_factory=dict)
+
+
+def window_share(
+    costs: dict[str, float], key_id: str, *, min_window_total: float = MIN_WINDOW_TOTAL_USD
+) -> WindowShare:
+    total = sum(max(0.0, cost) for cost in costs.values())
+    share = max(0.0, costs.get(key_id, 0.0)) / total if total > 0.0 else 0.0
+    if total < min_window_total:
+        return WindowShare(share, None)
+    consuming = sum(1 for cost in costs.values() if cost > 0.0)
+    if consuming <= 1:
+        return WindowShare(share, None)
+    return WindowShare(share, 1.0 / consuming)
 
 
 def _over_in_window(
@@ -86,13 +117,28 @@ def _over_in_window(
     *,
     min_window_total: float,
 ) -> bool:
-    total = sum(max(0.0, cost) for cost in costs.values())
-    if total < min_window_total:
-        return False
-    consuming = sum(1 for cost in costs.values() if cost > 0.0)
-    if consuming <= 1:
-        return False
-    return max(0.0, costs.get(key_id, 0.0)) / total > tolerance / consuming
+    window = window_share(costs, key_id, min_window_total=min_window_total)
+    return window.fair is not None and window.share > tolerance * window.fair
+
+
+def key_shares(
+    active_key_ids: frozenset[str], long_costs: dict[str, float], fast_costs: dict[str, float]
+) -> dict[str, KeyShares]:
+    return {
+        key_id: KeyShares(long=window_share(long_costs, key_id), fast=window_share(fast_costs, key_id))
+        for key_id in active_key_ids
+    }
+
+
+def describe_shares(shares: KeyShares) -> str:
+    """Human-readable share summary for logs and the admission 429 body."""
+
+    def _window(label: str, window: WindowShare) -> str:
+        if window.fair is None:
+            return f"{label} {window.share:.0%} (uncontended)"
+        return f"{label} {window.share:.0%} (fair {window.fair:.0%})"
+
+    return f"{_window('7d', shares.long)}, {_window('1h', shares.fast)}"
 
 
 def classify_over_share(
@@ -235,7 +281,26 @@ class FairShareQuotaClassifier:
             fast_costs=fast_costs,
             previously_over=previously_over,
         )
-        self._set_snapshot(over_share, len(active_key_ids))
+        shares = key_shares(active_key_ids, long_costs, fast_costs)
+        entered = over_share - previously_over
+        left = previously_over - over_share
+        if entered or left:
+            logger.info(
+                "Fair-share quota classification changed entered=%s left=%s over_share=%d active_keys=%d",
+                [f"{key_id}[{describe_shares(shares[key_id])}]" for key_id in sorted(entered)],
+                sorted(left),
+                len(over_share),
+                len(active_key_ids),
+            )
+        self._set_snapshot(over_share, len(active_key_ids), shares=shares)
+
+    def denial_detail(self, api_key_id: str) -> str | None:
+        """Share summary for a key's admission denial; ``None`` when unknown."""
+        snapshot = self._snapshot
+        if snapshot is None:
+            return None
+        shares = snapshot.shares.get(api_key_id)
+        return None if shares is None else describe_shares(shares)
 
     def reset_if_populated(self) -> None:
         """Drop cached classification and zero the gauge (mode turned off)."""
@@ -248,11 +313,14 @@ class FairShareQuotaClassifier:
         if PROMETHEUS_AVAILABLE and fair_share_quota_over_share_keys is not None:
             fair_share_quota_over_share_keys.set(0)
 
-    def _set_snapshot(self, over_share: frozenset[str], active_key_count: int) -> None:
+    def _set_snapshot(
+        self, over_share: frozenset[str], active_key_count: int, *, shares: Mapping[str, KeyShares] | None = None
+    ) -> None:
         self._snapshot = FairShareQuotaSnapshot(
             over_share_key_ids=over_share,
             active_foreground_key_count=active_key_count,
             computed_monotonic=time.monotonic(),
+            shares=shares or {},
         )
         if PROMETHEUS_AVAILABLE and fair_share_quota_over_share_keys is not None:
             fair_share_quota_over_share_keys.set(len(over_share))
@@ -272,6 +340,12 @@ def reset_fair_share_quota_classifier() -> None:
     """Test hook: drop the process-global classifier and its cache."""
     global _classifier
     _classifier = None
+
+
+def fair_share_denial_detail(api_key_id: str) -> str | None:
+    """Share summary appended to a degraded key's admission 429, so the person
+    being throttled sees why without dashboard access."""
+    return get_fair_share_quota_classifier().denial_detail(api_key_id)
 
 
 async def reset_fair_share_quota_classifier_if_mode_disabled() -> None:

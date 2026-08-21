@@ -8,6 +8,8 @@ Classification SHALL use per-key `cost_usd` attribution from the request usage h
 
 Degraded admission SHALL reuse the existing opportunistic gate machinery: the same budget-threshold resolution, the same `429` `rate_limit_exceeded` envelope with `Retry-After` when the burn window is closed, and the same `usage_limit_reached` envelope with `resets_at` when the pool is exhausted. The candidate filter for `fair_share_degraded` traffic SHALL differ from static `opportunistic` traffic in one way: instead of the last-account emergency floor, every `normal` and `burn_first` account SHALL be admitted only while it is ahead of linear pace on its long window and above the short-window floor that `preserve` accounts apply to opportunistic burn; `preserve` accounts SHALL require both their existing floors and the pace-line condition (an account marked preserve is never the one place an over-share key may fall behind pace). "Ahead of linear pace" means the long window's remaining percent exceeds the fraction of the window still ahead of `now` (window length inferred from time-to-reset: at most 10 days → weekly, otherwise a monthly plan window; the 10-day split tolerates a reset timestamp reported slightly past 7 days right after a weekly reset). The reserve therefore shrinks continuously to zero at reset: an over-share key may burn only surplus over pace, and no quota is held back all week to be spent or wasted on the last day. Each window SHALL gate independently and only while upstream reports it (an absent 5h window — `reset_at` unknown — leaves the long-window pace line binding alone; an account with no reported window fails open and admits degraded traffic rather than being treated as exhausted). Static `opportunistic` keys SHALL keep the existing emergency-floor filter unchanged. Classification SHALL apply at admission time only; in-flight turns SHALL NOT be reclassified.
 
+Observability: the classifier SHALL log at INFO each change of the over-share set (keys entered with their 7-day and 1-hour shares against the fair share, keys left, counts) and SHALL stay silent when a refresh leaves the set unchanged. A `429` `rate_limit_exceeded` denial of `fair_share_degraded` traffic at the HTTP admission gate SHALL append the key's own share summary (7-day and 1-hour share of pooled usage, each with the fair share or "uncontended") to the error message, so the throttled key holder can see why without dashboard access; the summary reflects the denying replica's cached classification.
+
 The mode SHALL NOT alter: explicit `traffic_class: opportunistic` keys (always opportunistic), explicit `ApiKeyLimit` enforcement (unchanged and still binding — classification can never admit a request past a configured hard limit), or the per-API-key concurrent-stream fair share. With the setting disabled (the default), admission behavior SHALL be identical to the mode not existing.
 
 #### Scenario: Mode is off by default
@@ -23,6 +25,12 @@ The mode SHALL NOT alter: explicit `traffic_class: opportunistic` keys (always o
 - **THEN** admission is evaluated through the opportunistic admission gate with the `fair_share_degraded` traffic class
 - **AND** if no account is above its pace floors the request is denied with the existing `429` `rate_limit_exceeded` envelope and `Retry-After` header
 - **AND** if an account is above its pace floors the request is admitted and proceeds through normal account selection
+
+#### Scenario: Denied over-share key is told its share
+
+- **GIVEN** an over-share key whose cached classification shows a 38% 7-day share against a 17% fair share and an uncontended 1-hour window
+- **WHEN** its request is denied at the HTTP admission gate
+- **THEN** the `429` message ends with `your key's share of pooled usage: 7d 38% (fair 17%), 1h 5% (uncontended)`
 
 #### Scenario: Under-share key is unaffected by pool congestion
 

@@ -198,6 +198,25 @@ class TestClassifyOverShare:
         )
 
 
+class TestKeyShares:
+    def test_window_share_reports_fair_share_only_when_contended(self) -> None:
+        contended = fair_share_quota.window_share({"a": 80.0, "b": 20.0}, "a")
+        assert contended.share == pytest.approx(0.8)
+        assert contended.fair == pytest.approx(0.5)
+        lone = fair_share_quota.window_share({"a": 80.0}, "a")
+        assert lone.share == pytest.approx(1.0)
+        assert lone.fair is None
+        noise = fair_share_quota.window_share({"a": 0.01, "b": 0.001}, "a")
+        assert noise.fair is None
+        assert fair_share_quota.window_share({}, "a") == fair_share_quota.WindowShare(0.0, None)
+
+    def test_describe_shares_is_human_readable(self) -> None:
+        shares = fair_share_quota.KeyShares(
+            long=fair_share_quota.WindowShare(0.38, 1 / 6), fast=fair_share_quota.WindowShare(0.05, None)
+        )
+        assert fair_share_quota.describe_shares(shares) == "7d 38% (fair 17%), 1h 5% (uncontended)"
+
+
 class TestClassifierCache:
     @pytest.fixture(autouse=True)
     def _stub_session(self, monkeypatch: pytest.MonkeyPatch):
@@ -238,6 +257,28 @@ class TestClassifierCache:
         assert await classifier.is_over_share("a") is True
         assert await classifier.is_over_share("b") is False
         assert calls == ["refresh"]
+
+    @pytest.mark.asyncio
+    async def test_refresh_logs_classification_changes_and_exposes_denial_detail(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        self._stub_queries(monkeypatch, active={"a", "b"}, long_costs={"a": 80.0, "b": 20.0}, fast_costs={})
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+
+        with caplog.at_level("INFO", logger=fair_share_quota.__name__):
+            await classifier.refresh()
+
+        assert classifier.denial_detail("a") == "7d 80% (fair 50%), 1h 0% (uncontended)"
+        assert classifier.denial_detail("missing") is None
+        changed = [record for record in caplog.records if "classification changed" in record.getMessage()]
+        assert len(changed) == 1
+        assert "entered=['a[7d 80% (fair 50%), 1h 0% (uncontended)]']" in changed[0].getMessage()
+
+        # Unchanged classification is silent.
+        caplog.clear()
+        with caplog.at_level("INFO", logger=fair_share_quota.__name__):
+            await classifier.refresh()
+        assert not [r for r in caplog.records if "classification changed" in r.getMessage()]
 
     @pytest.mark.asyncio
     async def test_lookup_never_blocks_and_schedules_single_flight_refresh(
@@ -492,7 +533,13 @@ class TestAdmissionRoutePath:
         monkeypatch.setattr(
             fair_share_quota,
             "get_fair_share_quota_classifier",
-            lambda: SimpleNamespace(is_over_share=_is_over_share, reset_if_populated=lambda: None),
+            lambda: SimpleNamespace(
+                is_over_share=_is_over_share,
+                reset_if_populated=lambda: None,
+                denial_detail=lambda key_id: (
+                    "7d 38% (fair 17%), 1h 5% (uncontended)" if key_id in over_share_ids else None
+                ),
+            ),
         )
 
     def _request(self) -> Request:
@@ -520,6 +567,10 @@ class TestAdmissionRoutePath:
         body = json.loads(bytes(response.body))
         assert body["error"]["code"] == "rate_limit_exceeded"
         assert body["error"]["message"].startswith("opportunistic burn window closed")
+        # The throttled user sees why without dashboard access.
+        assert body["error"]["message"].endswith(
+            "your key's share of pooled usage: 7d 38% (fair 17%), 1h 5% (uncontended)"
+        )
         assert response.headers["Retry-After"] == "60"
 
     @pytest.mark.asyncio
