@@ -679,6 +679,57 @@ def test_fair_share_degraded_burns_surplus_when_pool_is_behind_pace():
     assert result.account.account_id == "normal"
 
 
+def test_fair_share_degraded_fresh_week_reported_slightly_over_7d_is_still_weekly():
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            # Right after the weekly reset upstream reports reset_at a minute
+            # past 7d; read as a monthly window the line would be ~23% and an
+            # over-share key could burn three quarters of the fresh week.
+            secondary_used_percent=10.0,
+            secondary_reset_at=int(now + 7 * 24 * 3600 + 60),
+            routing_policy="normal",
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is None
+    assert result.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_degraded_preserve_account_also_requires_pace_surplus():
+    now = 1_700_000_000.0
+
+    def _states():
+        # 70% left with 6 days to go: above the flat preserve floors (15% / 20%),
+        # but behind the 86% pace line.
+        return [
+            AccountState(
+                "review",
+                AccountStatus.ACTIVE,
+                used_percent=30.0,
+                reset_at=now + 3 * 3600,
+                secondary_used_percent=30.0,
+                secondary_reset_at=int(now + 6 * 24 * 3600),
+                routing_policy="preserve",
+            )
+        ]
+
+    opportunistic = select_account(_states(), now=now, routing_strategy="usage_weighted", traffic_class="opportunistic")
+    assert opportunistic.account is not None
+
+    degraded = select_account(
+        _states(), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert degraded.account is None
+    assert degraded.error_message == _FAIR_SHARE_BLOCKED
+
+
 @pytest.mark.parametrize(
     ("weekly_used", "days_left", "admitted"),
     [

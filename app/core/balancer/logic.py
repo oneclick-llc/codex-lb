@@ -104,6 +104,7 @@ TRAFFIC_CLASS_OPPORTUNISTIC = "opportunistic"
 # last-account emergency floor, so an over-share key cannot push the pool
 # behind pace for the keys it is over-consuming against.
 TRAFFIC_CLASS_FAIR_SHARE_DEGRADED = "fair_share_degraded"
+FAIR_SHARE_WEEKLY_WINDOW_MAX_SECONDS = 10 * SECONDS_PER_DAY
 PRESERVE_MIN_WEEKLY_FLOOR_PCT = 5.0
 PRESERVE_MIN_SHORT_WINDOW_FLOOR_PCT = 10.0
 NORMAL_LAST_ACCOUNT_EMERGENCY_FLOOR_PCT = 5.0
@@ -388,8 +389,11 @@ def _above_emergency_floor(state: AccountState) -> bool:
 def _fair_share_long_window_pace_remaining_pct(seconds_left: float) -> float:
     # The share of the long window still ahead, i.e. what linear pace says
     # should remain. ponytail: AccountState carries no long-window length, so
-    # infer it from time-to-reset (<= 7d weekly, else a monthly plan window).
-    window_seconds = SECONDS_PER_WEEK if seconds_left <= SECONDS_PER_WEEK else 30 * SECONDS_PER_DAY
+    # infer it from time-to-reset. A weekly window is never longer than 7d and
+    # a monthly one never shorter than ~28d, so split at 10d: right after a
+    # weekly reset upstream may report reset_at a little over 7d ahead, and
+    # reading that as monthly would drop the line to ~23% of a fresh week.
+    window_seconds = SECONDS_PER_WEEK if seconds_left <= FAIR_SHARE_WEEKLY_WINDOW_MAX_SECONDS else 30 * SECONDS_PER_DAY
     return min(100.0, seconds_left / window_seconds * 100.0)
 
 
@@ -436,7 +440,12 @@ def _filter_opportunistic_candidates(
             if _expendable(state):
                 burn_first.append(state)
         elif policy == ROUTING_POLICY_PRESERVE:
-            if _preserve_allows_opportunistic_burn(state, current, preserve_count=preserve_count):
+            # Preserve floors are flat (15-25% weekly) and can sit below the
+            # pace line; an account the operator marked "preserve" must not be
+            # the one place an over-share key may dip behind pace.
+            if _preserve_allows_opportunistic_burn(state, current, preserve_count=preserve_count) and (
+                not fair_share or _fair_share_allows_burn(state, current, account_count=len(available))
+            ):
                 preserve.append(state)
         else:
             if _expendable(state):
