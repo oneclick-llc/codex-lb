@@ -1,12 +1,16 @@
 """Relative fair-share quota classification (dashboard ``fair_share_quota_mode``).
 
 When the mode is enabled, every active foreground API key is classified by its
-share of pooled ``cost_usd`` consumption. Keys consuming more than
-``ENTER_TOLERANCE x (1/N)`` of the pool in either the rolling long window or
-the rolling burst window are degraded to opportunistic admission (safe quota
-headroom only) until their share returns to at most ``EXIT_TOLERANCE x (1/N)``
-in both windows. ``N`` is the count of active, non-expired foreground keys, so
-adding or removing a team member needs no per-key configuration.
+share of pooled ``cost_usd`` consumption among the keys that actually consumed
+in a window. With ``k`` consuming keys, a key whose share exceeds
+``ENTER_TOLERANCE x (1/k)`` in either the rolling long window or the rolling
+burst window is degraded to ``fair_share_degraded`` admission (pace-floor
+headroom only, see ``app.core.balancer``) until its share returns to at most
+``EXIT_TOLERANCE x (1/k)`` in both windows. A lone consumer (``k == 1``) has
+nobody to share with and is never degraded; a window whose total spend is
+below ``MIN_WINDOW_TOTAL_USD`` is noise, not contention, and classifies nobody.
+Idle keys (vacation, CI/bot keys that never call) neither dilute nor inflate
+anyone's share, so adding a team member needs no per-key configuration.
 
 Consumption attribution reuses the request-usage hourly rollups for the folded
 history plus the raw ``request_logs`` tail beyond the fold watermark (long
@@ -32,7 +36,12 @@ from datetime import timedelta
 from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.core.balancer import TRAFFIC_CLASS_FOREGROUND, TRAFFIC_CLASS_OPPORTUNISTIC, TrafficClass
+from app.core.balancer import (
+    TRAFFIC_CLASS_FAIR_SHARE_DEGRADED,
+    TRAFFIC_CLASS_FOREGROUND,
+    TRAFFIC_CLASS_OPPORTUNISTIC,
+    TrafficClass,
+)
 from app.core.config.settings_cache import get_settings_cache
 from app.core.metrics.prometheus import (
     PROMETHEUS_AVAILABLE,
@@ -45,6 +54,7 @@ from app.db.session import get_background_session
 from app.modules.accounts.usage_time_rollup import WARMUP_REQUEST_KINDS, from_dimension, to_dimension
 from app.modules.accounts.usage_time_rollup_read import raw_windows_clause, sum_hourly_cost_by_api_key_window
 from app.modules.api_keys.service import ApiKeyData
+from app.modules.settings.service import DashboardSettingsData
 
 logger = logging.getLogger(__name__)
 
@@ -53,6 +63,9 @@ FAST_WINDOW = timedelta(hours=1)
 # ponytail: fixed tolerances, promote to settings only if operators ask.
 ENTER_TOLERANCE = 1.2
 EXIT_TOLERANCE = 1.0
+# Below this much total spend a window is noise: one $0.01 ping next to a $0.001
+# ping is a 91% "share" that means nothing and would only flap the hysteresis.
+MIN_WINDOW_TOTAL_USD = 0.05
 CACHE_TTL_SECONDS = 60.0
 # A hung usage read must release the single-flight refresh instead of pinning
 # a stale over-share snapshot forever; timing out fails open like any error.
@@ -66,6 +79,22 @@ class FairShareQuotaSnapshot:
     computed_monotonic: float
 
 
+def _over_in_window(
+    costs: dict[str, float],
+    key_id: str,
+    tolerance: float,
+    *,
+    min_window_total: float,
+) -> bool:
+    total = sum(max(0.0, cost) for cost in costs.values())
+    if total < min_window_total:
+        return False
+    consuming = sum(1 for cost in costs.values() if cost > 0.0)
+    if consuming <= 1:
+        return False
+    return max(0.0, costs.get(key_id, 0.0)) / total > tolerance / consuming
+
+
 def classify_over_share(
     *,
     active_key_ids: frozenset[str],
@@ -74,33 +103,23 @@ def classify_over_share(
     previously_over: frozenset[str],
     enter_tolerance: float = ENTER_TOLERANCE,
     exit_tolerance: float = EXIT_TOLERANCE,
+    min_window_total: float = MIN_WINDOW_TOTAL_USD,
 ) -> frozenset[str]:
     """Pure hysteresis classification of active keys against their fair share.
 
-    A key enters the over-share set when its share of a window's total cost
-    exceeds ``enter_tolerance / N`` in either window, and leaves it only once
-    its share is at most ``exit_tolerance / N`` in both windows.
+    Fair share is ``1/k`` per window, ``k`` = keys with positive spend in that
+    window (active or not: a ghost's spend still counts in the denominator and
+    in ``k``). A key enters the over-share set when its share exceeds
+    ``enter_tolerance / k`` in either window, and leaves it only once its share
+    is at most ``exit_tolerance / k`` in both windows. Windows with a lone
+    consumer or with total spend below ``min_window_total`` classify nobody.
     """
-    n = len(active_key_ids)
-    if n <= 1:
-        return frozenset()
-    fair_share = 1.0 / n
-    long_total = sum(long_costs.values())
-    fast_total = sum(fast_costs.values())
-
-    def _share(costs: dict[str, float], total: float, key_id: str) -> float:
-        if total <= 0.0:
-            return 0.0
-        return max(0.0, costs.get(key_id, 0.0)) / total
-
     over: set[str] = set()
     for key_id in active_key_ids:
-        long_share = _share(long_costs, long_total, key_id)
-        fast_share = _share(fast_costs, fast_total, key_id)
-        if key_id in previously_over:
-            if long_share > fair_share * exit_tolerance or fast_share > fair_share * exit_tolerance:
-                over.add(key_id)
-        elif long_share > fair_share * enter_tolerance or fast_share > fair_share * enter_tolerance:
+        tolerance = exit_tolerance if key_id in previously_over else enter_tolerance
+        if _over_in_window(long_costs, key_id, tolerance, min_window_total=min_window_total) or _over_in_window(
+            fast_costs, key_id, tolerance, min_window_total=min_window_total
+        ):
             over.add(key_id)
     return frozenset(over)
 
@@ -259,22 +278,25 @@ async def resolve_effective_traffic_class(
     api_key: ApiKeyData | None,
     *,
     requested: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
+    settings: DashboardSettingsData | None = None,
 ) -> TrafficClass:
     """Admission-time traffic class: static key class, else fair-share verdict.
 
     Explicitly opportunistic keys stay opportunistic. Foreground keys are
-    degraded to opportunistic only while fair-share quota mode is enabled and
-    the key is classified over-share; otherwise the caller's requested class
-    passes through unchanged.
+    degraded to ``fair_share_degraded`` only while fair-share quota mode is
+    enabled and the key is classified over-share; otherwise the caller's
+    requested class passes through unchanged. Callers that already hold the
+    dashboard settings pass them in to avoid a second cache lookup.
     """
     if api_key is None:
         return requested
     if api_key.traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC:
         return TRAFFIC_CLASS_OPPORTUNISTIC
-    if requested == TRAFFIC_CLASS_OPPORTUNISTIC:
-        return TRAFFIC_CLASS_OPPORTUNISTIC
-    settings = await get_settings_cache().get()
-    if not settings.fair_share_quota_mode_enabled:
+    if requested != TRAFFIC_CLASS_FOREGROUND:
+        return requested
+    if settings is None:
+        settings = await get_settings_cache().get()
+    if not getattr(settings, "fair_share_quota_mode_enabled", False):
         # Keep the gauge and cached verdicts honest after the mode is turned
         # off; a no-op when nothing is cached.
         get_fair_share_quota_classifier().reset_if_populated()
@@ -282,5 +304,5 @@ async def resolve_effective_traffic_class(
     if await get_fair_share_quota_classifier().is_over_share(api_key.id):
         if PROMETHEUS_AVAILABLE and fair_share_quota_degradations_total is not None:
             fair_share_quota_degradations_total.inc()
-        return TRAFFIC_CLASS_OPPORTUNISTIC
+        return TRAFFIC_CLASS_FAIR_SHARE_DEGRADED
     return requested

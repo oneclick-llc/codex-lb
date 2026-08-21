@@ -4,9 +4,9 @@ Teams sharing one codex-lb pool need per-user fairness without per-user configur
 
 ## What Changes
 
-- Add an opt-in fair-share quota mode (dashboard setting, default off). When enabled, each active foreground API key is classified by its share of actual pooled consumption (`cost_usd` attributed per key from request usage rollups) over a rolling long window plus a short burst window.
-- Keys consuming more than `tolerance x 1/N` of pooled consumption are admitted through the existing opportunistic admission path (safe quota headroom only) instead of foreground admission. Keys under their share stay foreground. No requests are newly rejected outright; over-share traffic degrades to headroom-only admission with the existing opportunistic denial envelopes.
-- No absolute numbers are configured anywhere: `N` is derived from active foreground keys, so adding a user is just creating a key.
+- Add an opt-in fair-share quota mode (dashboard setting, default off). When enabled, each active foreground API key is classified by its share of actual pooled consumption (`cost_usd` attributed per key from request usage rollups) among the `k` keys that consumed in a rolling long window plus a short burst window.
+- Keys consuming more than `tolerance x 1/k` of a window's pooled consumption are admitted through the opportunistic admission gate with a new `fair_share_degraded` traffic class: every account is gated by the preserve-style weekly pace floor and short-window floor instead of the last-account 5% emergency floor, so an over-share key burns the pool's surplus over linear pace but cannot push it behind pace. Keys under their share, lone consumers, and near-empty windows stay foreground. No requests are newly rejected outright; over-share traffic degrades to pace-floor admission with the existing opportunistic denial envelopes.
+- No absolute numbers are configured anywhere: `k` is derived from who actually consumed, so adding a user is just creating a key and idle keys (vacation, CI) never distort anyone's share.
 - Explicit `traffic_class: opportunistic` keys, explicit `ApiKeyLimit` rows, and the existing concurrency fair share are unchanged and compose with the new mode.
 
 ## Capabilities
@@ -17,7 +17,7 @@ Teams sharing one codex-lb pool need per-user fairness without per-user configur
 
 ### Modified Capabilities
 
-- `proxy-admission-control`: new requirement for relative fair-share quota admission (classification, degrade semantics, windows, defaults).
+- `proxy-admission-control`: new requirement for relative fair-share quota admission (classification, `fair_share_degraded` pace-floor gate, windows, defaults).
 - `frontend-architecture`: Settings routing section exposes the fair-share quota mode toggle.
 - `database-migrations`: dashboard settings schema gains the fair-share quota mode column with ORM + Alembic coverage.
 

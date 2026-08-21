@@ -65,7 +65,7 @@ from app.db.models import Account, AccountStatus, ModelSource, StickySessionKind
 from app.modules.accounts import auth_manager as auth_manager_module
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
-from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
+from app.modules.api_keys.service import TRAFFIC_CLASS_OPPORTUNISTIC, ApiKeyData, ApiKeyUsageReservationData
 from app.modules.proxy import affinity as proxy_affinity
 from app.modules.proxy import api as proxy_api
 from app.modules.proxy import request_policy as proxy_request_policy
@@ -3469,7 +3469,7 @@ async def test_opportunistic_admission_uses_api_key_enforced_model():
         enforced_model="gpt-5.2",
         enforced_reasoning_effort=None,
         enforced_service_tier=None,
-        traffic_class=proxy_api.TRAFFIC_CLASS_OPPORTUNISTIC,
+        traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
         expires_at=None,
         is_active=True,
         created_at=utcnow(),
@@ -3492,6 +3492,7 @@ async def test_opportunistic_admission_uses_api_key_enforced_model():
         api_key=api_key,
         model="gpt-5.2",
         lease_kind="stream",
+        traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
     )
 
 
@@ -3505,7 +3506,7 @@ async def test_opportunistic_admission_preserves_usage_limit_denial():
         enforced_model=None,
         enforced_reasoning_effort=None,
         enforced_service_tier=None,
-        traffic_class=proxy_api.TRAFFIC_CLASS_OPPORTUNISTIC,
+        traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
         expires_at=None,
         is_active=True,
         created_at=utcnow(),
@@ -6149,7 +6150,7 @@ async def test_select_codex_control_account_without_budget_honors_traffic_class(
         enforced_model=None,
         enforced_reasoning_effort=None,
         enforced_service_tier=None,
-        traffic_class=proxy_api.TRAFFIC_CLASS_OPPORTUNISTIC,
+        traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
         expires_at=None,
         is_active=True,
         created_at=utcnow(),
@@ -6159,12 +6160,12 @@ async def test_select_codex_control_account_without_budget_honors_traffic_class(
     result = await service._select_codex_control_account_without_budget(
         affinity=proxy_service._AffinityPolicy(key=None, kind=None),
         api_key=api_key,
-        traffic_class=proxy_api.TRAFFIC_CLASS_OPPORTUNISTIC,
+        traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
     )
 
     assert result is None
     assert select_account.await_args is not None
-    assert select_account.await_args.kwargs["traffic_class"] == proxy_api.TRAFFIC_CLASS_OPPORTUNISTIC
+    assert select_account.await_args.kwargs["traffic_class"] == TRAFFIC_CLASS_OPPORTUNISTIC
 
 
 @pytest.fixture(autouse=True)

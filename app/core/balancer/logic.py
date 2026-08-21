@@ -69,7 +69,7 @@ RoutingStrategy = Literal[
     "reset_drain",
     "single_account",
 ]
-TrafficClass = Literal["foreground", "opportunistic"]
+TrafficClass = Literal["foreground", "opportunistic", "fair_share_degraded"]
 UsageWeightedOrder = Literal["secondary_first", "primary_first"]
 ResetPreferenceWindow = Literal["primary", "secondary"]
 UNKNOWN_PLAN_FALLBACK = "free"
@@ -99,6 +99,11 @@ ROUTING_POLICY_BURN_FIRST = "burn_first"
 ROUTING_POLICY_PRESERVE = "preserve"
 TRAFFIC_CLASS_FOREGROUND = "foreground"
 TRAFFIC_CLASS_OPPORTUNISTIC = "opportunistic"
+# Foreground key degraded by fair-share quota mode: admitted like opportunistic
+# traffic, but gated by the preserve pace floors on EVERY account instead of the
+# last-account emergency floor, so an over-share key cannot push the pool
+# behind pace for the keys it is over-consuming against.
+TRAFFIC_CLASS_FAIR_SHARE_DEGRADED = "fair_share_degraded"
 PRESERVE_MIN_WEEKLY_FLOOR_PCT = 5.0
 PRESERVE_MIN_SHORT_WINDOW_FLOOR_PCT = 10.0
 NORMAL_LAST_ACCOUNT_EMERGENCY_FLOOR_PCT = 5.0
@@ -380,30 +385,68 @@ def _above_emergency_floor(state: AccountState) -> bool:
     )
 
 
+def _fair_share_long_window_pace_remaining_pct(seconds_left: float) -> float:
+    # The share of the long window still ahead, i.e. what linear pace says
+    # should remain. ponytail: AccountState carries no long-window length, so
+    # infer it from time-to-reset (<= 7d weekly, else a monthly plan window).
+    window_seconds = SECONDS_PER_WEEK if seconds_left <= SECONDS_PER_WEEK else 30 * SECONDS_PER_DAY
+    return min(100.0, seconds_left / window_seconds * 100.0)
+
+
+def _fair_share_allows_burn(state: AccountState, current: float, *, account_count: int) -> bool:
+    # Long window: degraded traffic may burn only the surplus over linear
+    # pace — remaining% must stay above the fraction of the window still
+    # ahead. The reserve shrinks continuously to zero at reset, so nothing is
+    # held back all week and then wasted (a flat floor would do exactly that).
+    # Each window gates only while upstream reports it: with the 5h limit
+    # removed upstream (reset_at None) the long window binds alone, and an
+    # account with nothing reported yet fails open.
+    long_remaining = _remaining_pct(state, secondary=True)
+    long_seconds_left = _seconds_until(state.secondary_reset_at, current)
+    if long_remaining is not None and long_seconds_left is not None:
+        if long_remaining <= _fair_share_long_window_pace_remaining_pct(long_seconds_left):
+            return False
+    short_remaining = _remaining_pct(state, secondary=False)
+    if short_remaining is not None and state.reset_at is not None:
+        if short_remaining <= _short_window_floor_pct(state, current, preserve_count=account_count):
+            return False
+    return True
+
+
 def _filter_opportunistic_candidates(
     available: list[AccountState],
     current: float,
+    *,
+    traffic_class: TrafficClass = TRAFFIC_CLASS_OPPORTUNISTIC,
 ) -> tuple[list[AccountState], str | None]:
     burn_first: list[AccountState] = []
     normal: list[AccountState] = []
     preserve: list[AccountState] = []
     preserve_count = sum(1 for state in available if _routing_policy(state) == ROUTING_POLICY_PRESERVE)
+    fair_share = traffic_class == TRAFFIC_CLASS_FAIR_SHARE_DEGRADED
+
+    def _expendable(state: AccountState) -> bool:
+        if fair_share:
+            return _fair_share_allows_burn(state, current, account_count=len(available))
+        return _has_other_usable_foreground_capacity(state, available, current) or _above_emergency_floor(state)
 
     for state in available:
         policy = _routing_policy(state)
         if policy == ROUTING_POLICY_BURN_FIRST:
-            if _has_other_usable_foreground_capacity(state, available, current) or _above_emergency_floor(state):
+            if _expendable(state):
                 burn_first.append(state)
         elif policy == ROUTING_POLICY_PRESERVE:
             if _preserve_allows_opportunistic_burn(state, current, preserve_count=preserve_count):
                 preserve.append(state)
         else:
-            if _has_other_usable_foreground_capacity(state, available, current) or _above_emergency_floor(state):
+            if _expendable(state):
                 normal.append(state)
 
     if burn_first or normal or preserve:
         return [*burn_first, *normal, *preserve], None
 
+    if fair_share:
+        return [], "fair-share pace floor blocks over-share burn"
     if any(_routing_policy(state) == ROUTING_POLICY_PRESERVE for state in available):
         return [], "preserve floor or stale usage data blocks opportunistic burn"
     return [], "no expendable account has emergency foreground reserve"
@@ -584,8 +627,10 @@ def select_account(
             state.last_error_at = None
         available.append(state)
 
-    if traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC and available:
-        opportunistic_available, reason = _filter_opportunistic_candidates(available, current)
+    if traffic_class != TRAFFIC_CLASS_FOREGROUND and available:
+        opportunistic_available, reason = _filter_opportunistic_candidates(
+            available, current, traffic_class=traffic_class
+        )
         if not opportunistic_available:
             return SelectionResult(None, f"opportunistic burn window closed: {reason}")
         available = opportunistic_available
@@ -611,8 +656,10 @@ def select_account(
                 return (s.last_error_at or 0.0) + backoff
 
             available.append(min(in_error_backoff, key=_backoff_expires_at))
-            if traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC:
-                opportunistic_available, reason = _filter_opportunistic_candidates(available, current)
+            if traffic_class != TRAFFIC_CLASS_FOREGROUND:
+                opportunistic_available, reason = _filter_opportunistic_candidates(
+                    available, current, traffic_class=traffic_class
+                )
                 if not opportunistic_available:
                     return SelectionResult(None, f"opportunistic burn window closed: {reason}")
                 available = opportunistic_available

@@ -281,8 +281,8 @@ if PROMETHEUS_AVAILABLE:
     fair_share_quota_degradations_total = Counter(
         "codex_lb_fair_share_quota_degradations_total",
         "Total traffic-class resolutions where fair-share quota mode degraded a foreground API key "
-        "to opportunistic (an HTTP admission resolves more than once; use for rate/trend, not exact "
-        "admission counts)",
+        "to fair_share_degraded admission (an HTTP admission resolves more than once; use for "
+        "rate/trend, not exact admission counts)",
         registry=REGISTRY,
     )
     # Sibling workers classify from the same rollups on independent cache

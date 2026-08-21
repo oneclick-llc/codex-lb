@@ -164,7 +164,7 @@ from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import (
-    TRAFFIC_CLASS_OPPORTUNISTIC,
+    TRAFFIC_CLASS_FOREGROUND,
     ApiKeyData,
     ApiKeyInvalidError,
     ApiKeyRateLimitExceededError,
@@ -7774,12 +7774,14 @@ async def _opportunistic_admission_denial(
 ) -> JSONResponse | None:
     if api_key is None:
         return None
-    if await resolve_effective_traffic_class(api_key) != TRAFFIC_CLASS_OPPORTUNISTIC:
+    traffic_class = await resolve_effective_traffic_class(api_key)
+    if traffic_class == TRAFFIC_CLASS_FOREGROUND:
         return None
     selection = await context.service.check_opportunistic_admission(
         api_key=api_key,
         model=_effective_optional_model_for_api_key(api_key, model),
         lease_kind=lease_kind,
+        traffic_class=traffic_class,
     )
     if selection.account is not None:
         return None

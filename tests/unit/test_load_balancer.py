@@ -601,6 +601,168 @@ def test_opportunistic_preserve_skips_when_weekly_floor_would_be_crossed():
     )
 
 
+_FAIR_SHARE_BLOCKED = "opportunistic burn window closed: fair-share pace floor blocks over-share burn"
+
+
+def test_fair_share_degraded_hits_pace_floor_where_opportunistic_still_burns():
+    now = 1_700_000_000.0
+
+    def _states():
+        # 20% left on both windows, on pace: static opportunistic may burn down
+        # to the 5% emergency floor, a fair-share-degraded key may not.
+        return [
+            AccountState(
+                "normal",
+                AccountStatus.ACTIVE,
+                used_percent=80.0,
+                reset_at=now + 3 * 3600,
+                secondary_used_percent=80.0,
+                secondary_reset_at=int(now + 3 * 24 * 3600),
+                routing_policy="normal",
+            )
+        ]
+
+    opportunistic = select_account(_states(), now=now, routing_strategy="usage_weighted", traffic_class="opportunistic")
+    assert opportunistic.account is not None
+
+    degraded = select_account(
+        _states(), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert degraded.account is None
+    assert degraded.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_degraded_pace_floor_applies_to_every_normal_account():
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            name,
+            AccountStatus.ACTIVE,
+            used_percent=85.0,
+            reset_at=now + 3 * 3600,
+            secondary_used_percent=85.0,
+            secondary_reset_at=int(now + 3 * 24 * 3600),
+            routing_policy="normal",
+        )
+        for name in ("normal-a", "normal-b")
+    ]
+
+    # With two normal accounts opportunistic traffic always has "other usable
+    # foreground capacity" and burns freely; fair share does not.
+    assert select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="opportunistic").account
+    degraded = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+    assert degraded.account is None
+    assert degraded.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_degraded_burns_surplus_when_pool_is_behind_pace():
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=50.0,
+            reset_at=now + 3 * 3600,
+            # One day left in the week with only 10% used: far ahead of linear
+            # pace (14% should remain, 90% does), the surplus is expendable —
+            # even though the account is in active foreground use.
+            secondary_used_percent=10.0,
+            secondary_reset_at=int(now + 24 * 3600),
+            routing_policy="normal",
+            last_selected_at=now - 60,
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is not None
+    assert result.account.account_id == "normal"
+
+
+@pytest.mark.parametrize(
+    ("weekly_used", "days_left", "admitted"),
+    [
+        # remaining 50% > 43% still ahead: surplus over pace, burnable.
+        (50.0, 3.0, True),
+        # remaining 40% <= 43%: at or behind pace, reserved for under-share keys.
+        (60.0, 3.0, False),
+        # Last day: the reserve has shrunk to 14%; 20% left is surplus again.
+        (80.0, 1.0, True),
+        (90.0, 1.0, False),
+        # Last hour: only 0.6% is reserved, nothing is left to waste at reset.
+        (99.0, 1.0 / 24.0, True),
+    ],
+)
+def test_fair_share_degraded_weekly_reserve_follows_linear_pace(weekly_used, days_left, admitted):
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            secondary_used_percent=weekly_used,
+            secondary_reset_at=int(now + days_left * 24 * 3600),
+            routing_policy="normal",
+            last_selected_at=now - 60,
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert (result.account is not None) is admitted
+    if not admitted:
+        assert result.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_degraded_fails_open_on_unknown_usage():
+    now = 1_700_000_000.0
+
+    def _states():
+        return [AccountState("fresh", AccountStatus.ACTIVE, routing_policy="normal")]
+
+    # Static opportunistic cannot prove an emergency reserve on a fresh account...
+    opportunistic = select_account(_states(), now=now, routing_strategy="usage_weighted", traffic_class="opportunistic")
+    assert opportunistic.account is None
+
+    # ...but a degraded foreground key must not be 429'd while foreground passes.
+    degraded = select_account(
+        _states(), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert degraded.account is not None
+    assert degraded.account.account_id == "fresh"
+
+
+def test_fair_share_degraded_weekly_floor_binds_without_a_5h_window():
+    now = 1_700_000_000.0
+
+    def _states(weekly_used: float):
+        # Upstream stopped reporting the 5h window (reset_at None, primary 0):
+        # only the weekly window exists, and it must still gate.
+        return [
+            AccountState(
+                "normal",
+                AccountStatus.ACTIVE,
+                used_percent=0.0,
+                reset_at=None,
+                secondary_used_percent=weekly_used,
+                secondary_reset_at=int(now + 3 * 24 * 3600),
+                routing_policy="normal",
+            )
+        ]
+
+    healthy = select_account(
+        _states(50.0), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert healthy.account is not None
+
+    tight = select_account(
+        _states(90.0), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert tight.account is None
+    assert tight.error_message == _FAIR_SHARE_BLOCKED
+
+
 def test_opportunistic_preserve_skips_when_short_window_floor_would_be_crossed():
     now = 1_700_000_000.0
     states = [

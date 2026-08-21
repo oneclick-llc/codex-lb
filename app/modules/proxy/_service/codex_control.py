@@ -333,7 +333,7 @@ class _CodexControlMixin:
                 account = await proxy._select_codex_control_account_without_budget(
                     affinity=affinity,
                     api_key=api_key,
-                    traffic_class=await resolve_effective_traffic_class(api_key),
+                    traffic_class=await resolve_effective_traffic_class(api_key, settings=settings),
                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                     privacy_policy=effective_privacy_policy,
                 )

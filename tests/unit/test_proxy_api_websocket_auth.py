@@ -15,6 +15,7 @@ from starlette.types import Message, Receive, Scope, Send
 import app.core.auth.dependencies as auth_dependencies
 import app.core.request_locality as request_locality
 import app.modules.proxy.api as proxy_api_module
+import app.modules.proxy.fair_share_quota as fair_share_quota_module
 import app.modules.proxy.request_policy as proxy_request_policy
 from app.core.clients.proxy import ProxyResponseError
 from app.core.errors import openai_error
@@ -509,6 +510,13 @@ async def test_stream_responses_preserves_forwarded_effective_service_tier(monke
         proxy_api_module.proxy_service_module,
         "get_settings",
         lambda: SimpleNamespace(http_responses_session_bridge_enabled=True),
+    )
+    # The fair-share admission gate resolves the key's effective traffic class
+    # from dashboard settings; this test has no database behind the cache.
+    monkeypatch.setattr(
+        fair_share_quota_module,
+        "get_settings_cache",
+        lambda: SimpleNamespace(get=AsyncMock(return_value=SimpleNamespace(fair_share_quota_mode_enabled=False))),
     )
     context = cast(
         proxy_api_module.ProxyContext,

@@ -11,7 +11,11 @@ import pytest
 from fastapi import Request
 
 import app.modules.proxy.fair_share_quota as fair_share_quota
-from app.core.balancer import TRAFFIC_CLASS_FOREGROUND, TRAFFIC_CLASS_OPPORTUNISTIC
+from app.core.balancer import (
+    TRAFFIC_CLASS_FAIR_SHARE_DEGRADED,
+    TRAFFIC_CLASS_FOREGROUND,
+    TRAFFIC_CLASS_OPPORTUNISTIC,
+)
 from app.core.utils.time import utcnow
 from app.modules.api_keys.service import ApiKeyData
 from app.modules.proxy import api as proxy_api
@@ -114,13 +118,82 @@ class TestClassifyOverShare:
             == frozenset()
         )
 
-    def test_inactive_keys_count_toward_totals_but_not_classified(self) -> None:
+    def test_ghost_consumption_counts_in_denominator(self) -> None:
         keys = frozenset({"a", "b"})
         # "ghost" consumed most of the pool but is not active; active keys are
-        # judged against the total including ghost's consumption.
+        # judged against k=3 consumers and the total including ghost's spend.
         costs = {"ghost": 80.0, "a": 15.0, "b": 5.0}
         assert (
             classify_over_share(active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset())
+            == frozenset()
+        )
+
+    # --- sparse activity: idle keys must not make the working ones over-share
+
+    def test_lone_consumer_in_burst_window_is_not_degraded(self) -> None:
+        keys = frozenset({"a", "b", "c", "d", "e"})
+        balanced = {key: 10.0 for key in keys}
+        assert (
+            classify_over_share(
+                active_key_ids=keys, long_costs=balanced, fast_costs={"a": 0.5}, previously_over=frozenset()
+            )
+            == frozenset()
+        )
+
+    def test_two_equal_consumers_among_five_keys_are_not_degraded(self) -> None:
+        keys = frozenset({"a", "b", "c", "d", "e"})
+        balanced = {key: 10.0 for key in keys}
+        assert (
+            classify_over_share(
+                active_key_ids=keys, long_costs=balanced, fast_costs={"a": 1.0, "b": 1.0}, previously_over=frozenset()
+            )
+            == frozenset()
+        )
+
+    def test_three_of_five_working_this_week_equally_are_not_degraded(self) -> None:
+        keys = frozenset({"a", "b", "c", "d", "e"})
+        assert (
+            classify_over_share(
+                active_key_ids=keys,
+                long_costs={"a": 10.0, "b": 10.0, "c": 10.0},
+                fast_costs={},
+                previously_over=frozenset(),
+            )
+            == frozenset()
+        )
+
+    def test_heavy_consumer_among_two_active_is_degraded(self) -> None:
+        keys = frozenset({"a", "b", "c", "d", "e"})
+        # k=2 -> enter at >60%.
+        assert classify_over_share(
+            active_key_ids=keys, long_costs={"a": 70.0, "b": 30.0}, fast_costs={}, previously_over=frozenset()
+        ) == frozenset({"a"})
+        assert (
+            classify_over_share(
+                active_key_ids=keys, long_costs={"a": 55.0, "b": 45.0}, fast_costs={}, previously_over=frozenset()
+            )
+            == frozenset()
+        )
+
+    def test_window_below_min_total_is_noise(self) -> None:
+        keys = frozenset({"a", "b"})
+        assert (
+            classify_over_share(
+                active_key_ids=keys, long_costs={}, fast_costs={"a": 0.01, "b": 0.001}, previously_over=frozenset()
+            )
+            == frozenset()
+        )
+        # Same ratio above the floor is contention.
+        assert classify_over_share(
+            active_key_ids=keys, long_costs={}, fast_costs={"a": 1.0, "b": 0.1}, previously_over=frozenset()
+        ) == frozenset({"a"})
+
+    def test_noise_window_releases_previously_degraded_key(self) -> None:
+        keys = frozenset({"a", "b"})
+        assert (
+            classify_over_share(
+                active_key_ids=keys, long_costs={}, fast_costs={"a": 0.01}, previously_over=frozenset({"a"})
+            )
             == frozenset()
         )
 
@@ -342,7 +415,7 @@ class TestResolveEffectiveTrafficClass:
     async def test_mode_enabled_degrades_over_share_key(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._stub_settings(monkeypatch, enabled=True)
         self._stub_classifier(monkeypatch, {"k1"})
-        assert await resolve_effective_traffic_class(_make_api_key("k1")) == TRAFFIC_CLASS_OPPORTUNISTIC
+        assert await resolve_effective_traffic_class(_make_api_key("k1")) == TRAFFIC_CLASS_FAIR_SHARE_DEGRADED
 
     @pytest.mark.asyncio
     async def test_mode_enabled_keeps_under_share_key_foreground(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -363,7 +436,7 @@ class TestResolveEffectiveTrafficClass:
         monkeypatch.setattr(fair_share_quota, "get_fair_share_quota_classifier", lambda: classifier)
 
         self._stub_settings(monkeypatch, enabled=True)
-        assert await resolve_effective_traffic_class(_make_api_key("k1")) == TRAFFIC_CLASS_OPPORTUNISTIC
+        assert await resolve_effective_traffic_class(_make_api_key("k1")) == TRAFFIC_CLASS_FAIR_SHARE_DEGRADED
 
         self._stub_settings(monkeypatch, enabled=False)
         assert await resolve_effective_traffic_class(_make_api_key("k1")) == TRAFFIC_CLASS_FOREGROUND
@@ -428,6 +501,8 @@ class TestAdmissionRoutePath:
 
         assert response is None
         service.check_opportunistic_admission.assert_awaited_once()
+        gate_kwargs = service.check_opportunistic_admission.await_args.kwargs
+        assert gate_kwargs["traffic_class"] == TRAFFIC_CLASS_FAIR_SHARE_DEGRADED
 
     @pytest.mark.asyncio
     async def test_mode_off_foreground_key_bypasses_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:

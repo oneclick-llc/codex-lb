@@ -945,7 +945,7 @@ class LoadBalancer:
         if selected_snapshot is None:
             owner_restricted_selection = owner_restricted_selection or selection_error_code == "hard_affinity_saturated"
             opportunistic_policy_blocked = (
-                traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC
+                traffic_class != TRAFFIC_CLASS_FOREGROUND
                 and error_message is not None
                 and error_message.startswith("opportunistic burn window closed")
             )
@@ -957,7 +957,7 @@ class LoadBalancer:
                 )
             if required_continuity_owner and selection_error_code in (None, "hard_affinity_saturated"):
                 selection_error_code = CONTINUITY_OWNER_UNAVAILABLE
-            if traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC and error_message and selection_error_code is None:
+            if traffic_class != TRAFFIC_CLASS_FOREGROUND and error_message and selection_error_code is None:
                 return AccountSelection(
                     account=None,
                     error_message=error_message,
@@ -1384,6 +1384,7 @@ class LoadBalancer:
         lease_kind: AccountLeaseKind | None = None,
         concurrency_caps: AccountConcurrencyCaps | None = None,
         stream_reserve_slots: int = 0,
+        traffic_class: TrafficClass = TRAFFIC_CLASS_OPPORTUNISTIC,
     ) -> AccountSelection:
         selection_inputs = await self._load_selection_inputs(
             model=model,
@@ -1436,7 +1437,7 @@ class LoadBalancer:
             secondary_budget_threshold_pct=secondary_budget_threshold_pct,
             apply_secondary_budget_threshold=True,
             deterministic_probe=True,
-            traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
+            traffic_class=traffic_class,
             ignore_standard_quota=False,
             usage_exhaustion_states=states,
         )
