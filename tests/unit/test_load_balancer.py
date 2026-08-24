@@ -679,6 +679,27 @@ def test_fair_share_degraded_burns_surplus_when_pool_is_behind_pace():
     assert result.account.account_id == "normal"
 
 
+def test_fair_share_degraded_untouched_fresh_week_never_blocks():
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            # Weekly window just reset, nothing spent: the pace line sits at
+            # 100% and without slack would block against an untouched account.
+            secondary_used_percent=0.0,
+            secondary_reset_at=int(now + 7 * 24 * 3600),
+            routing_policy="normal",
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is not None
+
+
 def test_fair_share_degraded_fresh_week_reported_slightly_over_7d_is_still_weekly():
     now = 1_700_000_000.0
     states = [
@@ -689,8 +710,10 @@ def test_fair_share_degraded_fresh_week_reported_slightly_over_7d_is_still_weekl
             reset_at=None,
             # Right after the weekly reset upstream reports reset_at a minute
             # past 7d; read as a monthly window the line would be ~23% and an
-            # over-share key could burn three quarters of the fresh week.
-            secondary_used_percent=10.0,
+            # over-share key could burn three quarters of the fresh week. 25%
+            # used on a fresh week is >10pp behind pace only under the weekly
+            # reading.
+            secondary_used_percent=25.0,
             secondary_reset_at=int(now + 7 * 24 * 3600 + 60),
             routing_policy="normal",
         )
@@ -733,14 +756,14 @@ def test_fair_share_degraded_preserve_account_also_requires_pace_surplus():
 @pytest.mark.parametrize(
     ("weekly_used", "days_left", "admitted"),
     [
-        # remaining 50% > 43% still ahead: surplus over pace, burnable.
-        (50.0, 3.0, True),
-        # remaining 40% <= 43%: at or behind pace, reserved for under-share keys.
-        (60.0, 3.0, False),
-        # Last day: the reserve has shrunk to 14%; 20% left is surplus again.
-        (80.0, 1.0, True),
-        (90.0, 1.0, False),
-        # Last hour: only 0.6% is reserved, nothing is left to waste at reset.
+        # remaining 40% vs pace 43%: 3pp behind is within the 10pp slack.
+        (60.0, 3.0, True),
+        # remaining 30% vs pace 43%: 13pp behind pace, genuinely overdrawn.
+        (70.0, 3.0, False),
+        # Last day: pace 14%; 10% left is within slack, 3% is not.
+        (90.0, 1.0, True),
+        (97.0, 1.0, False),
+        # Last hour: the slack exceeds the remaining pace line, never blocked.
         (99.0, 1.0 / 24.0, True),
     ],
 )

@@ -105,6 +105,11 @@ TRAFFIC_CLASS_OPPORTUNISTIC = "opportunistic"
 # behind pace for the keys it is over-consuming against.
 TRAFFIC_CLASS_FAIR_SHARE_DEGRADED = "fair_share_degraded"
 FAIR_SHARE_WEEKLY_WINDOW_MAX_SECONDS = 10 * SECONDS_PER_DAY
+# An over-share key is cut only once the pool is measurably overdrawn — more
+# than this many percentage points behind linear pace. Without slack the line
+# sits at ~100% on a freshly reset window and blocks degraded keys against
+# accounts that have spent nothing at all.
+FAIR_SHARE_PACE_SLACK_PCT = 10.0
 PRESERVE_MIN_WEEKLY_FLOOR_PCT = 5.0
 PRESERVE_MIN_SHORT_WINDOW_FLOOR_PCT = 10.0
 NORMAL_LAST_ACCOUNT_EMERGENCY_FLOOR_PCT = 5.0
@@ -398,17 +403,19 @@ def _fair_share_long_window_pace_remaining_pct(seconds_left: float) -> float:
 
 
 def _fair_share_allows_burn(state: AccountState, current: float, *, account_count: int) -> bool:
-    # Long window: degraded traffic may burn only the surplus over linear
-    # pace — remaining% must stay above the fraction of the window still
-    # ahead. The reserve shrinks continuously to zero at reset, so nothing is
-    # held back all week and then wasted (a flat floor would do exactly that).
+    # Long window: degraded traffic is cut only while the pool is more than
+    # FAIR_SHARE_PACE_SLACK_PCT behind linear pace — genuinely overdrawn, not
+    # merely at the line. The reserve shrinks continuously to zero at reset,
+    # so nothing is held back all week and then wasted (a flat floor would do
+    # exactly that), and a freshly reset window never blocks anybody.
     # Each window gates only while upstream reports it: with the 5h limit
     # removed upstream (reset_at None) the long window binds alone, and an
     # account with nothing reported yet fails open.
     long_remaining = _remaining_pct(state, secondary=True)
     long_seconds_left = _seconds_until(state.secondary_reset_at, current)
     if long_remaining is not None and long_seconds_left is not None:
-        if long_remaining <= _fair_share_long_window_pace_remaining_pct(long_seconds_left):
+        pace_remaining = _fair_share_long_window_pace_remaining_pct(long_seconds_left)
+        if long_remaining <= pace_remaining - FAIR_SHARE_PACE_SLACK_PCT:
             return False
     short_remaining = _remaining_pct(state, secondary=False)
     if short_remaining is not None and state.reset_at is not None:

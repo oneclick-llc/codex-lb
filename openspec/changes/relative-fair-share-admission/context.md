@@ -25,10 +25,11 @@ Routing over-share keys through the opportunistic gate keeps the system
 work-conserving, but the static opportunistic floor (5% of the last account,
 and effectively nothing while two normal accounts are up) is too weak to
 protect anyone. `fair_share_degraded` therefore gates on the **linear pace
-line** of each account's long window: an over-share key is admitted only
-while remaining% exceeds the share of the week still ahead (86% with 6 days
-left, 43% with 3, 14% with 1, ~0% at reset). It burns the surplus the pool
-is ahead by and nothing more; the on-pace share stays with the keys it was
+line** of each account's long window, with 10 points of slack: an over-share
+key is blocked only while remaining% has fallen more than 10pp behind the
+share of the week still ahead (below 76% remaining with 6 days left, 33%
+with 3, 4% with 1, never in the last hours). A fresh or barely used window
+never blocks anybody; the on-pace share stays with the keys it was
 over-consuming against, and the reserve melts to zero at reset instead of
 being stranded. The 5h window, while upstream reports one, keeps the preserve
 short floor (20–30%). Windows gate only while upstream reports them — with
@@ -36,12 +37,12 @@ the 5h limit removed upstream, the pace line is the whole gate. Together with th
 existing concurrency fair share this bounds how much one user can take from
 everyone else.
 
-Worked example, one account, no 5h window, 3 days to weekly reset (pace:
-43% should remain): with 40% left a static `opportunistic` key is admitted
-(40% > 5%) while a `fair_share_degraded` key is denied with
-`429 rate_limit_exceeded` + `Retry-After`; with 50% left it is admitted. One
-day before reset (pace: 14%) the same key is admitted again at 20% left —
-the surplus was going to expire anyway.
+Worked example, one account, no 5h window, 3 days to weekly reset (pace
+43% - 10pp slack = 33%): with 30% left a static `opportunistic` key is
+admitted (30% > 5%) while a `fair_share_degraded` key is denied with
+`429 rate_limit_exceeded` + `Retry-After`; with 40% left it is admitted. One
+day before reset (floor 4%) the same key is admitted again at 10% left — the
+surplus was going to expire anyway.
 
 ## Sync notes
 
