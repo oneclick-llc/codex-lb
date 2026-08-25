@@ -5,6 +5,7 @@
 - [x] Effective-traffic-class resolution (static class else `fair_share_degraded`) wired into every opportunistic admission call site: HTTP `_opportunistic_admission_denial` sites and the WebSocket/codex-control parity paths; `check_opportunistic_admission` forwards the class to the balancer.
 - [x] Balancer: `TRAFFIC_CLASS_FAIR_SHARE_DEGRADED` candidate filter applies the preserve pace floors to every `normal`/`burn_first` account, fails open on unknown usage; static `opportunistic` filter unchanged.
 - [x] Metrics: degradation counter and current over-share key gauge following existing `codex_lb_*` fair-share metric naming.
+- [x] Denial envelope: `opportunistic_burn_window_closed` registered as a local-overload code — 429 `rate_limit_error` (+ merged `Retry-After`) on every selection surface, account-health-neutral; regression test.
 - [x] Observability: INFO log on over-share set changes with per-key shares; HTTP admission `429` carries the key's own share summary.
 - [x] Settings-invalidation callback (`NAMESPACE_SETTINGS`) resets the classifier and gauge on every replica when the mode is off; idle-worker test.
 - [x] Frontend: routing-section toggle + settings schema/payload plumbing.

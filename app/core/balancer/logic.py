@@ -402,24 +402,22 @@ def _fair_share_long_window_pace_remaining_pct(seconds_left: float) -> float:
     return min(100.0, seconds_left / window_seconds * 100.0)
 
 
-def _fair_share_allows_burn(state: AccountState, current: float, *, account_count: int) -> bool:
-    # Long window: degraded traffic is cut only while the pool is more than
-    # FAIR_SHARE_PACE_SLACK_PCT behind linear pace — genuinely overdrawn, not
-    # merely at the line. The reserve shrinks continuously to zero at reset,
-    # so nothing is held back all week and then wasted (a flat floor would do
-    # exactly that), and a freshly reset window never blocks anybody.
-    # Each window gates only while upstream reports it: with the 5h limit
-    # removed upstream (reset_at None) the long window binds alone, and an
-    # account with nothing reported yet fails open.
+def _fair_share_allows_burn(state: AccountState, current: float) -> bool:
+    # The fair-share gate is the long-window pace line alone: degraded traffic
+    # is cut only while the pool is more than FAIR_SHARE_PACE_SLACK_PCT behind
+    # linear pace — genuinely overdrawn, not merely at the line. The reserve
+    # shrinks continuously to zero at reset, so nothing is held back all week
+    # and then wasted, and a freshly reset window never blocks anybody. The 5h
+    # window deliberately does not gate here: it is upstream's own burst
+    # control and binds every traffic class equally once exhausted, while a
+    # flat short floor was observed cutting degraded keys hard on a pool whose
+    # week sat 99% idle just because an earlier burst had drained the 5h
+    # window. With no long window reported the gate fails open.
     long_remaining = _remaining_pct(state, secondary=True)
     long_seconds_left = _seconds_until(state.secondary_reset_at, current)
     if long_remaining is not None and long_seconds_left is not None:
         pace_remaining = _fair_share_long_window_pace_remaining_pct(long_seconds_left)
         if long_remaining <= pace_remaining - FAIR_SHARE_PACE_SLACK_PCT:
-            return False
-    short_remaining = _remaining_pct(state, secondary=False)
-    if short_remaining is not None and state.reset_at is not None:
-        if short_remaining <= _short_window_floor_pct(state, current, preserve_count=account_count):
             return False
     return True
 
@@ -438,7 +436,7 @@ def _filter_opportunistic_candidates(
 
     def _expendable(state: AccountState) -> bool:
         if fair_share:
-            return _fair_share_allows_burn(state, current, account_count=len(available))
+            return _fair_share_allows_burn(state, current)
         return _has_other_usable_foreground_capacity(state, available, current) or _above_emergency_floor(state)
 
     for state in available:
@@ -451,7 +449,7 @@ def _filter_opportunistic_candidates(
             # pace line; an account the operator marked "preserve" must not be
             # the one place an over-share key may dip behind pace.
             if _preserve_allows_opportunistic_burn(state, current, preserve_count=preserve_count) and (
-                not fair_share or _fair_share_allows_burn(state, current, account_count=len(available))
+                not fair_share or _fair_share_allows_burn(state, current)
             ):
                 preserve.append(state)
         else:

@@ -70,3 +70,19 @@ def test_local_overload_codes_keep_rate_limit_contract(local_code: str):
     assert payload["error"]["type"] == "rate_limit_error"
     assert payload["error"]["code"] == local_code
     assert "resets_at" not in payload["error"]
+
+
+def test_opportunistic_burn_window_closed_is_codex_compatible_429():
+    # WS/first-turn/codex-control selection paths previously fell through to a
+    # 503 that Codex surfaced as "unexpected status 503".
+    status, envelope = selection_failure_response(
+        AccountSelection(
+            account=None,
+            error_code="opportunistic_burn_window_closed",
+            error_message="opportunistic burn window closed: fair-share pace floor blocks over-share burn",
+        )
+    )
+
+    assert status == 429
+    assert envelope["error"]["type"] == "rate_limit_error"
+    assert envelope["error"]["code"] == "opportunistic_burn_window_closed"

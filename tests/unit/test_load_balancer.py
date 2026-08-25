@@ -604,12 +604,13 @@ def test_opportunistic_preserve_skips_when_weekly_floor_would_be_crossed():
 _FAIR_SHARE_BLOCKED = "opportunistic burn window closed: fair-share pace floor blocks over-share burn"
 
 
-def test_fair_share_degraded_hits_pace_floor_where_opportunistic_still_burns():
+def test_fair_share_degraded_hits_pace_line_where_opportunistic_still_burns():
     now = 1_700_000_000.0
 
     def _states():
-        # 20% left on both windows, on pace: static opportunistic may burn down
-        # to the 5% emergency floor, a fair-share-degraded key may not.
+        # 20% left on both windows, 3 days to reset (weekly pace line 33%):
+        # static opportunistic may burn down to the 5% emergency floor, a
+        # fair-share-degraded key may not.
         return [
             AccountState(
                 "normal",
@@ -653,6 +654,30 @@ def test_fair_share_degraded_pace_floor_applies_to_every_normal_account():
     degraded = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
     assert degraded.account is None
     assert degraded.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_degraded_ignores_drained_5h_window_when_week_is_idle():
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            # An earlier burst drained the 5h window, but the week is 99% idle:
+            # the degraded key must NOT be cut (observed complaint: hard 429s on
+            # an almost untouched pool for hours after a colleague's burst).
+            used_percent=85.0,
+            reset_at=now + 3 * 3600,
+            secondary_used_percent=1.0,
+            secondary_reset_at=int(now + 5 * 24 * 3600),
+            routing_policy="normal",
+            last_selected_at=now - 60,
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is not None
+    assert result.account.account_id == "normal"
 
 
 def test_fair_share_degraded_burns_surplus_when_pool_is_behind_pace():

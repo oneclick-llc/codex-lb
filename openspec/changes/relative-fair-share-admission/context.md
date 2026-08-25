@@ -31,9 +31,10 @@ share of the week still ahead (below 76% remaining with 6 days left, 33%
 with 3, 4% with 1, never in the last hours). A fresh or barely used window
 never blocks anybody; the on-pace share stays with the keys it was
 over-consuming against, and the reserve melts to zero at reset instead of
-being stranded. The 5h window, while upstream reports one, keeps the preserve
-short floor (20–30%). Windows gate only while upstream reports them — with
-the 5h limit removed upstream, the pace line is the whole gate. Together with the 1-hour burst window and the
+being stranded. The 5h window never gates fair-share admission — upstream's own
+5h exhaustion already binds every traffic class equally, and a drained 5h
+window on an idle week must not cut degraded keys (observed in production).
+The pace line on the weekly window is the whole gate. Together with the 1-hour burst window and the
 existing concurrency fair share this bounds how much one user can take from
 everyone else.
 
