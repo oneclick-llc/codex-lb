@@ -704,6 +704,29 @@ def test_fair_share_degraded_burns_surplus_when_pool_is_behind_pace():
     assert result.account.account_id == "normal"
 
 
+def test_fair_share_block_logs_per_account_diagnostics(caplog):
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "acc-diag",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            secondary_used_percent=70.0,
+            secondary_reset_at=int(now + 3 * 24 * 3600),
+            routing_policy="normal",
+        )
+    ]
+
+    with caplog.at_level("WARNING", logger="app.core.balancer.logic"):
+        result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is None
+    blocked = [r.getMessage() for r in caplog.records if "Fair-share pace gate blocked" in r.getMessage()]
+    assert len(blocked) == 1
+    assert "acc-diag[policy=normal status=active weekly_remaining=30.0 pace_line=42.9 slack=10.0" in blocked[0]
+
+
 def test_fair_share_degraded_untouched_fresh_week_never_blocks():
     now = 1_700_000_000.0
     states = [

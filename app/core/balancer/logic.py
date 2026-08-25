@@ -422,6 +422,19 @@ def _fair_share_allows_burn(state: AccountState, current: float) -> bool:
     return True
 
 
+def _fair_share_reject_detail(state: AccountState, current: float) -> str:
+    long_remaining = _remaining_pct(state, secondary=True)
+    long_seconds_left = _seconds_until(state.secondary_reset_at, current)
+    pace_line = (
+        None if long_seconds_left is None else round(_fair_share_long_window_pace_remaining_pct(long_seconds_left), 1)
+    )
+    return (
+        f"{state.account_id}[policy={_routing_policy(state)} status={state.status.value} "
+        f"weekly_remaining={long_remaining} pace_line={pace_line} slack={FAIR_SHARE_PACE_SLACK_PCT} "
+        f"short_remaining={_remaining_pct(state, secondary=False)} short_reset_known={state.reset_at is not None}]"
+    )
+
+
 def _filter_opportunistic_candidates(
     available: list[AccountState],
     current: float,
@@ -460,6 +473,12 @@ def _filter_opportunistic_candidates(
         return [*burn_first, *normal, *preserve], None
 
     if fair_share:
+        # Cold path (every candidate rejected): log why each account failed so
+        # a production denial is diagnosable without database access.
+        logger.warning(
+            "Fair-share pace gate blocked all candidates: %s",
+            "; ".join(_fair_share_reject_detail(state, current) for state in available),
+        )
         return [], "fair-share pace floor blocks over-share burn"
     if any(_routing_policy(state) == ROUTING_POLICY_PRESERVE for state in available):
         return [], "preserve floor or stale usage data blocks opportunistic burn"
