@@ -2569,6 +2569,7 @@ def _state_from_account(
         cooldown_until=runtime.cooldown_until,
         secondary_used_percent=effective_secondary_used_percent,
         secondary_reset_at=secondary_reset,
+        usage_pressure_pct=pressure_pct,
         last_error_at=runtime.last_error_at,
         last_selected_at=runtime.last_selected_at,
         error_count=runtime.error_count,

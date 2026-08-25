@@ -724,7 +724,43 @@ def test_fair_share_block_logs_per_account_diagnostics(caplog):
     assert result.account is None
     blocked = [r.getMessage() for r in caplog.records if "Fair-share pace gate blocked" in r.getMessage()]
     assert len(blocked) == 1
-    assert "acc-diag[policy=normal status=active weekly_remaining=30.0 pace_line=42.9 slack=10.0" in blocked[0]
+    assert (
+        "acc-diag[policy=normal status=active weekly_remaining=30.0 pressure=0.0 pace_line=42.9 slack=10.0"
+        in blocked[0]
+    )
+
+
+def test_fair_share_gate_ignores_inflight_pressure_on_idle_week():
+    now = 1_700_000_000.0
+
+    def _state(effective_used: float, pressure: float):
+        # A highly parallel burst bakes 2.5pp per inflight request into the
+        # state's percents; the pace gate must judge the raw consumed budget.
+        return [
+            AccountState(
+                "normal",
+                AccountStatus.ACTIVE,
+                used_percent=0.0,
+                reset_at=None,
+                secondary_used_percent=effective_used,
+                secondary_reset_at=int(now + 6.9 * 24 * 3600),
+                routing_policy="normal",
+                usage_pressure_pct=pressure,
+            )
+        ]
+
+    # Real weekly usage 1%, 30 parallel streams (+75pp effective): admitted.
+    pressured = select_account(
+        _state(76.0, 75.0), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert pressured.account is not None
+
+    # The same effective percent from genuine consumption: blocked.
+    burned = select_account(
+        _state(76.0, 0.0), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert burned.account is None
+    assert burned.error_message == _FAIR_SHARE_BLOCKED
 
 
 def test_fair_share_degraded_untouched_fresh_week_never_blocks():

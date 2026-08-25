@@ -151,6 +151,9 @@ class AccountState:
     leased_tokens: float = 0.0
     routing_policy: str = ROUTING_POLICY_NORMAL
     ignore_standard_quota: bool = False
+    # Selection-ranking pressure (inflight penalty + leased tokens) already
+    # baked into used_percent/secondary_used_percent by the state builder.
+    usage_pressure_pct: float = 0.0
 
 
 @dataclass
@@ -430,8 +433,13 @@ def _fair_share_allows_burn(state: AccountState, current: float) -> bool:
     long_remaining = _remaining_pct(state, secondary=True)
     long_seconds_left = _seconds_until(state.secondary_reset_at, current)
     if long_remaining is not None and long_seconds_left is not None:
+        # Judge actual consumed budget, not the selection-ranking pressure: the
+        # inflight penalty (2.5pp per concurrent request) is baked into the
+        # state's percents and a highly parallel burst on an idle pool would
+        # otherwise read as a week burned far behind pace.
+        raw_remaining = min(100.0, long_remaining + state.usage_pressure_pct)
         pace_remaining = _fair_share_long_window_pace_remaining_pct(long_seconds_left)
-        if long_remaining <= pace_remaining - FAIR_SHARE_PACE_SLACK_PCT:
+        if raw_remaining <= pace_remaining - FAIR_SHARE_PACE_SLACK_PCT:
             return False
     return True
 
@@ -444,7 +452,8 @@ def _fair_share_reject_detail(state: AccountState, current: float) -> str:
     )
     return (
         f"{state.account_id}[policy={_routing_policy(state)} status={state.status.value} "
-        f"weekly_remaining={long_remaining} pace_line={pace_line} slack={FAIR_SHARE_PACE_SLACK_PCT} "
+        f"weekly_remaining={long_remaining} pressure={round(state.usage_pressure_pct, 1)} "
+        f"pace_line={pace_line} slack={FAIR_SHARE_PACE_SLACK_PCT} "
         f"short_remaining={_remaining_pct(state, secondary=False)} "
         f"short_reset_known={_short_window_reset_at(state) is not None}]"
     )
