@@ -907,6 +907,34 @@ def test_opportunistic_preserve_skips_when_short_window_floor_would_be_crossed()
     )
 
 
+def test_preserve_without_reported_5h_window_gates_on_weekly_floor_alone():
+    now = 1_700_000_000.0
+
+    def _states(weekly_used: float):
+        # Upstream stopped reporting the 5h window entirely: reset_at is None
+        # on every account. Preserve must fall back to the weekly floor, not
+        # block all opportunistic burn forever.
+        return [
+            AccountState(
+                "review",
+                AccountStatus.ACTIVE,
+                used_percent=0.0,
+                reset_at=None,
+                secondary_used_percent=weekly_used,
+                secondary_reset_at=int(now + 3 * 24 * 3600),
+                routing_policy="preserve",
+            )
+        ]
+
+    for traffic_class in ("opportunistic", "fair_share_degraded"):
+        healthy = select_account(_states(1.0), now=now, routing_strategy="usage_weighted", traffic_class=traffic_class)
+        assert healthy.account is not None, traffic_class
+
+    # The weekly preserve floor itself still binds (15% floor, 10% remaining).
+    floored = select_account(_states(90.0), now=now, routing_strategy="usage_weighted", traffic_class="opportunistic")
+    assert floored.account is None
+
+
 def test_opportunistic_preserve_weekly_floor_decreases_near_reset_when_pace_is_behind():
     now = 1_700_000_000.0
     states = [

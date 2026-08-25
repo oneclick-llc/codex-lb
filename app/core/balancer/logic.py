@@ -335,8 +335,14 @@ def _weekly_pace_floor_pct(state: AccountState, current: float) -> float:
     return max(PRESERVE_MIN_WEEKLY_FLOOR_PCT, pace_floor)
 
 
+def _short_window_reset_at(state: AccountState) -> float | None:
+    # state.reset_at is a rate-limit/cooldown recovery hint and is None on
+    # healthy accounts; the 5h window's own end lives in primary_reset_at.
+    return state.reset_at if state.reset_at is not None else state.primary_reset_at
+
+
 def _short_window_floor_pct(state: AccountState, current: float, *, preserve_count: int) -> float:
-    remaining_seconds = _seconds_until(state.reset_at, current)
+    remaining_seconds = _seconds_until(_short_window_reset_at(state), current)
     floor = PRESERVE_MIN_SHORT_WINDOW_FLOOR_PCT
     if remaining_seconds is None:
         return 100.0
@@ -350,15 +356,23 @@ def _short_window_floor_pct(state: AccountState, current: float, *, preserve_cou
 
 
 def _preserve_allows_opportunistic_burn(state: AccountState, current: float, *, preserve_count: int) -> bool:
-    if _remaining_pct(state, secondary=True) is None or _remaining_pct(state, secondary=False) is None:
+    # The weekly floor is the core preserve guarantee and requires weekly data.
+    weekly_remaining = _remaining_pct(state, secondary=True)
+    if weekly_remaining is None or state.secondary_reset_at is None:
         return False
-    if state.secondary_reset_at is None or state.reset_at is None:
+    if weekly_remaining <= _weekly_pace_floor_pct(state, current):
         return False
-    weekly_floor = _weekly_pace_floor_pct(state, current)
-    short_floor = _short_window_floor_pct(state, current, preserve_count=preserve_count)
-    return (_remaining_pct(state, secondary=True) or 0.0) > weekly_floor and (
-        _remaining_pct(state, secondary=False) or 0.0
-    ) > short_floor
+    # The short-window floor gates only while upstream reports a 5h window.
+    # With the 5h limit removed upstream no account has a short-window reset
+    # (and state.reset_at is a cooldown hint that is None on every healthy
+    # account); treating that as "stale data" walled preserve accounts off
+    # from ALL opportunistic burn forever — observed as fair-share denials on
+    # a pool with under 1% of the week consumed.
+    short_remaining = _remaining_pct(state, secondary=False)
+    if short_remaining is not None and _short_window_reset_at(state) is not None:
+        if short_remaining <= _short_window_floor_pct(state, current, preserve_count=preserve_count):
+            return False
+    return True
 
 
 def _has_other_usable_foreground_capacity(
@@ -431,7 +445,8 @@ def _fair_share_reject_detail(state: AccountState, current: float) -> str:
     return (
         f"{state.account_id}[policy={_routing_policy(state)} status={state.status.value} "
         f"weekly_remaining={long_remaining} pace_line={pace_line} slack={FAIR_SHARE_PACE_SLACK_PCT} "
-        f"short_remaining={_remaining_pct(state, secondary=False)} short_reset_known={state.reset_at is not None}]"
+        f"short_remaining={_remaining_pct(state, secondary=False)} "
+        f"short_reset_known={_short_window_reset_at(state) is not None}]"
     )
 
 
