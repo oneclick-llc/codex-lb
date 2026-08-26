@@ -22,11 +22,23 @@ from app.modules.proxy import api as proxy_api
 from app.modules.proxy.fair_share_quota import (
     FairShareQuotaClassifier,
     classify_over_share,
+    key_shares,
     resolve_effective_traffic_class,
 )
 from app.modules.proxy.load_balancer import AccountSelection
 
 pytestmark = pytest.mark.unit
+
+
+def _classify(
+    *,
+    active_key_ids: frozenset[str],
+    long_costs: dict[str, float],
+    fast_costs: dict[str, float],
+    previously_over: frozenset[str],
+) -> frozenset[str]:
+    """Costs -> over-share set, the same two steps the classifier runs."""
+    return classify_over_share(key_shares(active_key_ids, long_costs, fast_costs), previously_over)
 
 
 def _make_api_key(key_id: str, traffic_class: str = TRAFFIC_CLASS_FOREGROUND) -> ApiKeyData:
@@ -51,14 +63,14 @@ class TestClassifyOverShare:
         keys = frozenset({"a", "b", "c"})
         costs = {"a": 10.0, "b": 10.0, "c": 10.0}
         assert (
-            classify_over_share(active_key_ids=keys, long_costs=costs, fast_costs=costs, previously_over=frozenset())
+            _classify(active_key_ids=keys, long_costs=costs, fast_costs=costs, previously_over=frozenset())
             == frozenset()
         )
 
     def test_heavy_key_enters_over_share(self) -> None:
         keys = frozenset({"a", "b", "c"})
         costs = {"a": 80.0, "b": 10.0, "c": 10.0}
-        assert classify_over_share(
+        assert _classify(
             active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset()
         ) == frozenset({"a"})
 
@@ -67,8 +79,7 @@ class TestClassifyOverShare:
         # 38% < 40% enter threshold (1.2 x 1/3).
         costs = {"a": 38.0, "b": 31.0, "c": 31.0}
         assert (
-            classify_over_share(active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset())
-            == frozenset()
+            _classify(active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset()) == frozenset()
         )
 
     def test_hysteresis_keeps_key_degraded_until_back_at_fair_share(self) -> None:
@@ -76,19 +87,18 @@ class TestClassifyOverShare:
         # 35% is between exit (33.3%) and enter (40%): stays degraded only if
         # it already was degraded.
         costs = {"a": 35.0, "b": 33.0, "c": 32.0}
-        assert classify_over_share(
+        assert _classify(
             active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset({"a"})
         ) == frozenset({"a"})
         assert (
-            classify_over_share(active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset())
-            == frozenset()
+            _classify(active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset()) == frozenset()
         )
 
     def test_recovered_key_is_restored(self) -> None:
         keys = frozenset({"a", "b", "c"})
         costs = {"a": 30.0, "b": 35.0, "c": 35.0}
         assert (
-            classify_over_share(active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset({"a"}))
+            _classify(active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset({"a"}))
             == frozenset()
         )
 
@@ -96,13 +106,13 @@ class TestClassifyOverShare:
         keys = frozenset({"a", "b", "c"})
         long_costs = {"a": 10.0, "b": 10.0, "c": 10.0}
         fast_costs = {"a": 99.0, "b": 1.0}
-        assert classify_over_share(
+        assert _classify(
             active_key_ids=keys, long_costs=long_costs, fast_costs=fast_costs, previously_over=frozenset()
         ) == frozenset({"a"})
 
     def test_single_key_is_never_degraded(self) -> None:
         assert (
-            classify_over_share(
+            _classify(
                 active_key_ids=frozenset({"a"}),
                 long_costs={"a": 100.0},
                 fast_costs={"a": 100.0},
@@ -114,7 +124,7 @@ class TestClassifyOverShare:
     def test_zero_consumption_pool_degrades_nobody(self) -> None:
         keys = frozenset({"a", "b"})
         assert (
-            classify_over_share(active_key_ids=keys, long_costs={}, fast_costs={}, previously_over=frozenset({"a"}))
+            _classify(active_key_ids=keys, long_costs={}, fast_costs={}, previously_over=frozenset({"a"}))
             == frozenset()
         )
 
@@ -124,8 +134,7 @@ class TestClassifyOverShare:
         # judged against k=3 consumers and the total including ghost's spend.
         costs = {"ghost": 80.0, "a": 15.0, "b": 5.0}
         assert (
-            classify_over_share(active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset())
-            == frozenset()
+            _classify(active_key_ids=keys, long_costs=costs, fast_costs={}, previously_over=frozenset()) == frozenset()
         )
 
     # --- sparse activity: idle keys must not make the working ones over-share
@@ -134,9 +143,7 @@ class TestClassifyOverShare:
         keys = frozenset({"a", "b", "c", "d", "e"})
         balanced = {key: 10.0 for key in keys}
         assert (
-            classify_over_share(
-                active_key_ids=keys, long_costs=balanced, fast_costs={"a": 0.5}, previously_over=frozenset()
-            )
+            _classify(active_key_ids=keys, long_costs=balanced, fast_costs={"a": 0.5}, previously_over=frozenset())
             == frozenset()
         )
 
@@ -144,7 +151,7 @@ class TestClassifyOverShare:
         keys = frozenset({"a", "b", "c", "d", "e"})
         balanced = {key: 10.0 for key in keys}
         assert (
-            classify_over_share(
+            _classify(
                 active_key_ids=keys, long_costs=balanced, fast_costs={"a": 1.0, "b": 1.0}, previously_over=frozenset()
             )
             == frozenset()
@@ -153,7 +160,7 @@ class TestClassifyOverShare:
     def test_three_of_five_working_this_week_equally_are_not_degraded(self) -> None:
         keys = frozenset({"a", "b", "c", "d", "e"})
         assert (
-            classify_over_share(
+            _classify(
                 active_key_ids=keys,
                 long_costs={"a": 10.0, "b": 10.0, "c": 10.0},
                 fast_costs={},
@@ -165,11 +172,11 @@ class TestClassifyOverShare:
     def test_heavy_consumer_among_two_active_is_degraded(self) -> None:
         keys = frozenset({"a", "b", "c", "d", "e"})
         # k=2 -> enter at >60%.
-        assert classify_over_share(
+        assert _classify(
             active_key_ids=keys, long_costs={"a": 70.0, "b": 30.0}, fast_costs={}, previously_over=frozenset()
         ) == frozenset({"a"})
         assert (
-            classify_over_share(
+            _classify(
                 active_key_ids=keys, long_costs={"a": 55.0, "b": 45.0}, fast_costs={}, previously_over=frozenset()
             )
             == frozenset()
@@ -178,37 +185,41 @@ class TestClassifyOverShare:
     def test_window_below_min_total_is_noise(self) -> None:
         keys = frozenset({"a", "b"})
         assert (
-            classify_over_share(
+            _classify(
                 active_key_ids=keys, long_costs={}, fast_costs={"a": 0.01, "b": 0.001}, previously_over=frozenset()
             )
             == frozenset()
         )
         # Same ratio above the floor is contention.
-        assert classify_over_share(
+        assert _classify(
             active_key_ids=keys, long_costs={}, fast_costs={"a": 1.0, "b": 0.1}, previously_over=frozenset()
         ) == frozenset({"a"})
 
     def test_noise_window_releases_previously_degraded_key(self) -> None:
         keys = frozenset({"a", "b"})
         assert (
-            classify_over_share(
-                active_key_ids=keys, long_costs={}, fast_costs={"a": 0.01}, previously_over=frozenset({"a"})
-            )
+            _classify(active_key_ids=keys, long_costs={}, fast_costs={"a": 0.01}, previously_over=frozenset({"a"}))
             == frozenset()
         )
 
 
 class TestKeyShares:
-    def test_window_share_reports_fair_share_only_when_contended(self) -> None:
-        contended = fair_share_quota.window_share({"a": 80.0, "b": 20.0}, "a")
+    def test_window_shares_report_fair_share_only_when_contended(self) -> None:
+        contended = fair_share_quota.window_shares({"a": 80.0, "b": 20.0}, ["a"])["a"]
         assert contended.share == pytest.approx(0.8)
         assert contended.fair == pytest.approx(0.5)
-        lone = fair_share_quota.window_share({"a": 80.0}, "a")
+        lone = fair_share_quota.window_shares({"a": 80.0}, ["a"])["a"]
         assert lone.share == pytest.approx(1.0)
         assert lone.fair is None
-        noise = fair_share_quota.window_share({"a": 0.01, "b": 0.001}, "a")
+        noise = fair_share_quota.window_shares({"a": 0.01, "b": 0.001}, ["a"])["a"]
         assert noise.fair is None
-        assert fair_share_quota.window_share({}, "a") == fair_share_quota.WindowShare(0.0, None)
+        assert fair_share_quota.window_shares({}, ["a"]) == {"a": fair_share_quota.WindowShare(0.0, None)}
+
+    def test_window_shares_sums_the_window_once_for_every_key(self) -> None:
+        # Non-consuming active keys get a 0 share against the same fair share.
+        shares = fair_share_quota.window_shares({"a": 60.0, "b": 40.0}, ["a", "b", "idle"])
+        assert shares["a"] == fair_share_quota.WindowShare(pytest.approx(0.6), pytest.approx(0.5))
+        assert shares["idle"] == fair_share_quota.WindowShare(0.0, pytest.approx(0.5))
 
     def test_describe_shares_is_human_readable(self) -> None:
         shares = fair_share_quota.KeyShares(
@@ -225,6 +236,14 @@ class TestClassifierCache:
             yield None
 
         monkeypatch.setattr(fair_share_quota, "get_background_session", _fake_session)
+        # refresh() re-checks the mode before publishing.
+        self._stub_mode(monkeypatch, enabled=True)
+
+    def _stub_mode(self, monkeypatch: pytest.MonkeyPatch, *, enabled: bool) -> None:
+        async def _get():
+            return SimpleNamespace(fair_share_quota_mode_enabled=enabled)
+
+        monkeypatch.setattr(fair_share_quota, "get_settings_cache", lambda: SimpleNamespace(get=_get))
 
     def _stub_queries(self, monkeypatch: pytest.MonkeyPatch, *, active, long_costs, fast_costs, calls=None):
         async def _active(_session):
@@ -415,6 +434,76 @@ class TestClassifierCache:
         # A broken read must not keep the key degraded.
         assert await classifier.is_over_share("a") is False
 
+    @pytest.mark.asyncio
+    async def test_refresh_failure_preserves_hysteresis_memory(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+        self._stub_queries(
+            monkeypatch,
+            active={"a", "b", "c"},
+            long_costs={"a": 80.0, "b": 10.0, "c": 10.0},
+            fast_costs={},
+        )
+        await classifier.refresh()
+        assert await classifier.is_over_share("a") is True
+
+        async def _boom(_session):
+            raise RuntimeError("rollup read failed")
+
+        monkeypatch.setattr(fair_share_quota, "_active_foreground_key_ids", _boom)
+        await classifier.refresh()
+        assert await classifier.is_over_share("a") is False
+
+        # 35% is between exit (33.3%) and enter (40%): the transient failure
+        # must not have let "a" escape via the wider ENTER tolerance.
+        self._stub_queries(
+            monkeypatch,
+            active={"a", "b", "c"},
+            long_costs={"a": 35.0, "b": 33.0, "c": 32.0},
+            fast_costs={},
+        )
+        await classifier.refresh()
+        assert await classifier.is_over_share("a") is True
+
+    @pytest.mark.asyncio
+    async def test_refresh_does_not_republish_after_mode_turned_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+        self._stub_queries(
+            monkeypatch,
+            active={"a", "b", "c"},
+            long_costs={"a": 80.0, "b": 10.0, "c": 10.0},
+            fast_costs={},
+        )
+        # An admission holding pre-toggle settings schedules a refresh; the
+        # invalidation reset runs while it is in flight.
+        classifier.reset_if_populated()
+        self._stub_mode(monkeypatch, enabled=False)
+
+        await classifier.refresh()
+
+        assert classifier._snapshot is None
+        assert classifier._previously_over == frozenset()
+        if fair_share_quota.PROMETHEUS_AVAILABLE and fair_share_quota.fair_share_quota_over_share_keys is not None:
+            assert fair_share_quota.fair_share_quota_over_share_keys._value.get() == 0
+
+    @pytest.mark.asyncio
+    async def test_drain_refresh_cancels_the_background_task(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
+
+        async def _hang(_session):
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(fair_share_quota, "_active_foreground_key_ids", _hang)
+        assert await classifier.is_over_share("a") is False
+        task = classifier._refresh_task
+        assert task is not None and not task.done()
+
+        await classifier.drain_refresh()
+
+        assert task.done()
+        assert classifier._refresh_task is None
+        # Idempotent: shutdown may run with nothing in flight.
+        await classifier.drain_refresh()
+
 
 class TestSettingsInvalidationCallback:
     def _stub_settings(self, monkeypatch: pytest.MonkeyPatch, *, enabled: bool) -> None:
@@ -427,7 +516,7 @@ class TestSettingsInvalidationCallback:
     async def test_idle_worker_drops_snapshot_when_mode_turned_off(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # No admission request ever reaches this worker; only the settings bump does.
         classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
-        classifier._set_snapshot(frozenset({"k1", "k2"}), 5)
+        classifier._set_snapshot(frozenset({"k1", "k2"}))
         monkeypatch.setattr(fair_share_quota, "get_fair_share_quota_classifier", lambda: classifier)
         self._stub_settings(monkeypatch, enabled=False)
 
@@ -440,7 +529,7 @@ class TestSettingsInvalidationCallback:
     @pytest.mark.asyncio
     async def test_unrelated_settings_save_keeps_snapshot_while_mode_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
         classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
-        classifier._set_snapshot(frozenset({"k1"}), 3)
+        classifier._set_snapshot(frozenset({"k1"}))
         monkeypatch.setattr(fair_share_quota, "get_fair_share_quota_classifier", lambda: classifier)
         self._stub_settings(monkeypatch, enabled=True)
 
@@ -507,7 +596,7 @@ class TestResolveEffectiveTrafficClass:
     @pytest.mark.asyncio
     async def test_disabling_mode_resets_cached_classification(self, monkeypatch: pytest.MonkeyPatch) -> None:
         classifier = FairShareQuotaClassifier(cache_ttl_seconds=60.0)
-        classifier._set_snapshot(frozenset({"k1"}), 3)
+        classifier._set_snapshot(frozenset({"k1"}))
         monkeypatch.setattr(fair_share_quota, "get_fair_share_quota_classifier", lambda: classifier)
 
         self._stub_settings(monkeypatch, enabled=True)

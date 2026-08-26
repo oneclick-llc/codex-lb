@@ -20,16 +20,24 @@ from app.modules.accounts.usage_time_rollup import (
     to_dimension,
 )
 from app.modules.accounts.usage_time_rollup_read import sum_hourly_cost_by_api_key_window
-from app.modules.proxy.fair_share_quota import _long_window_cost_by_key
+from app.modules.proxy.fair_share_quota import _fast_window_cost_by_key, _long_window_cost_by_key
 from app.modules.request_logs.repository import RequestLogsRepository
 
 pytestmark = pytest.mark.integration
 
 
-def _hourly_cost_row(bucket_epoch: int, *, api_key_id: str, model: str, request_kind: str, cost: float):
+def _hourly_cost_row(
+    bucket_epoch: int,
+    *,
+    api_key_id: str,
+    model: str,
+    request_kind: str,
+    cost: float,
+    account_id: str = "acc_a",
+):
     return HourlyUsageRollupRow(
         bucket_epoch=bucket_epoch,
-        account_id="acc_a",
+        account_id=account_id,
         api_key_id=api_key_id,
         model=model,
         service_tier=DIMENSION_SENTINEL,
@@ -77,22 +85,33 @@ async def test_long_window_costs_aggregate_in_sql_across_watermark(db_setup):
                 _hourly_cost_row(
                     hour_1, api_key_id=DIMENSION_SENTINEL, model="gpt-5.1-codex", request_kind="normal", cost=50.0
                 ),
+                # Model-source/BYOK spend: real api key, no pooled account.
+                _hourly_cost_row(
+                    hour_1,
+                    api_key_id="k1",
+                    model="gpt-5.1-codex",
+                    request_kind="normal",
+                    cost=500.0,
+                    account_id=DIMENSION_SENTINEL,
+                ),
             ]
         )
         await session.execute(update(AccountUsageRollupState).values(hourly_folded_through=watermark))
         await session.commit()
 
-    # Raw tail beyond the watermark: one attributed row plus two excluded ones.
+    # Raw tail beyond the watermark: one attributed row plus three excluded ones.
     async with SessionLocal() as session:
         logs_repo = RequestLogsRepository(session)
         now = utcnow()
-        for request_id, api_key_id, request_kind, cost in (
-            ("req-k1-raw", "k1", "normal", 1.0),
-            ("req-warmup-raw", "k1", "limit_warmup", 9.0),
-            ("req-anon-raw", None, "normal", 7.0),
+        for request_id, account_id, api_key_id, request_kind, cost in (
+            ("req-k1-raw", "acc_a", "k1", "normal", 1.0),
+            ("req-warmup-raw", "acc_a", "k1", "limit_warmup", 9.0),
+            ("req-anon-raw", "acc_a", None, "normal", 7.0),
+            # Model-source/BYOK: real api key, no pooled account.
+            ("req-byok-raw", None, "k1", "normal", 500.0),
         ):
             await logs_repo.add_log(
-                account_id="acc_a",
+                account_id=account_id,
                 request_id=request_id,
                 model="gpt-5.1-codex",
                 input_tokens=10,
@@ -118,15 +137,20 @@ async def test_long_window_costs_aggregate_in_sql_across_watermark(db_setup):
             None,
             filters=(
                 RequestUsageHourlyRollup.api_key_id != to_dimension(None),
+                RequestUsageHourlyRollup.account_id != to_dimension(None),
                 RequestUsageHourlyRollup.request_kind.not_in(WARMUP_REQUEST_KINDS),
             ),
         )
-        # SQL-side aggregation: one summed entry per key, warmup and
-        # unattributed rows excluded, raw complement returned for the tail.
+        # SQL-side aggregation: one summed entry per key, warmup and rows
+        # without api-key or account attribution excluded, raw complement
+        # returned for the tail.
         assert folded == {"k1": pytest.approx(5.0), "k2": pytest.approx(1.0)}
         assert raw_windows
         assert any(start == watermark for start, _end in raw_windows)
 
     async with SessionLocal() as session:
+        # $500 of BYOK spend on each side of the fold watermark consumed none
+        # of the pool, so it enters neither the numerator nor the denominator.
         costs = await _long_window_cost_by_key(session)
         assert costs == {"k1": pytest.approx(6.0), "k2": pytest.approx(1.0)}
+        assert await _fast_window_cost_by_key(session) == {"k1": pytest.approx(1.0)}
