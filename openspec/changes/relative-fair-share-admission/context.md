@@ -31,10 +31,14 @@ share of the week still ahead (below 76% remaining with 6 days left, 33%
 with 3, 4% with 1, never in the last hours). A fresh or barely used window
 never blocks anybody; the on-pace share stays with the keys it was
 over-consuming against, and the reserve melts to zero at reset instead of
-being stranded. The 5h window never gates fair-share admission — upstream's own
-5h exhaustion already binds every traffic class equally, and a drained 5h
-window on an idle week must not cut degraded keys (observed in production).
-The pace line on the weekly window is the whole gate. Together with the 1-hour burst window and the
+being stranded. The 5h window does not gate fair-share admission on `normal` and
+`burn_first` accounts — upstream's own 5h exhaustion already binds every
+traffic class equally, and a drained 5h window on an idle week must not cut
+degraded keys (observed in production). On those accounts the pace line is the
+whole gate; `preserve` accounts additionally keep their own floors (weekly
+always, short-window whenever upstream reports a 5h reset), because the account
+an operator asked to protect must not be the one place an over-share key may
+dip. Together with the 1-hour burst window and the
 existing concurrency fair share this bounds how much one user can take from
 everyone else.
 
@@ -45,12 +49,47 @@ admitted (30% > 5%) while a `fair_share_degraded` key is denied with
 day before reset (floor 4%) the same key is admitted again at 10% left — the
 surplus was going to expire anyway.
 
+## Two fixes that the toggle does not gate
+
+The toggle gates fair-share classification and the `fair_share_degraded`
+traffic class, and nothing else. Two changes here are live with the mode off,
+because both are bugs in the pre-existing static opportunistic gate that this
+work surfaced; a toggle would only hide them from the spec, not from users.
+
+1. **Preserve short-window gating is per reported window.** The preserve gate
+   used to fail closed when the account had no short-window reset. That is
+   every healthy account now that upstream stopped reporting the 5h window
+   (`state.reset_at` is a rate-limit recovery hint, `None` on a healthy
+   account), so preserve accounts were walled off from *all* opportunistic burn
+   forever — observed as denials on a pool with under 1% of the week consumed.
+   The short-window floor now binds only while a short-window reset is actually
+   reported; otherwise the weekly floor is the whole preserve gate. Fail-closed
+   here protected nothing: an unreported window is not a drained one.
+   Consequence with the mode off: static `opportunistic` keys can now burn
+   preserve accounts that previously rejected them.
+2. **`opportunistic_burn_window_closed` is a local-overload code.** The HTTP
+   routes already answered these denials with `429 rate_limit_exceeded`; the
+   WebSocket, first-turn, and codex-control selection paths fell through to a
+   `503` that Codex surfaces as "unexpected status". Registering the code lines
+   those paths up with the HTTP contract and, through the same registry, makes
+   the denial account-health-neutral and makes an http-bridge prewarm that hits
+   it record `skipped` instead of `error` — all three correct for the same
+   reason: a closed burn window is neither the account's fault nor a server
+   outage.
+
+Both are stated normatively in the change's `MODIFIED` requirement for
+"Opportunistic Proxy Traffic Burns Only Safe Quota". Neither depends on the
+fair-share work, so both could ship as a separate PR ahead of it.
+
 ## Sync notes
 
 On `/opsx:sync`, fold the "why relative shares" rationale above into
 `openspec/specs/proxy-admission-control/context.md` alongside the new
-"Relative fair-share quota admission" requirement. `docs/routing.md` already
-carries the operator-facing description and the capability link-back.
+"Relative fair-share quota admission" requirement, and apply the `MODIFIED`
+"Opportunistic Proxy Traffic Burns Only Safe Quota" text (preserve short-window
+gating + the `opportunistic_burn_window_closed` contract) to the main spec.
+`docs/routing.md` already carries the operator-facing description, including
+the two toggle-independent fixes, and the capability link-back.
 
 ## Verification
 

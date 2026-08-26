@@ -5,7 +5,8 @@ Teams sharing one codex-lb pool need per-user fairness without per-user configur
 ## What Changes
 
 - Add an opt-in fair-share quota mode (dashboard setting, default off). When enabled, each active foreground API key is classified by its share of actual pooled consumption (`cost_usd` attributed per key from request usage rollups) among the `k` keys that consumed in a rolling long window plus a short burst window.
-- Keys consuming more than `tolerance x 1/k` of a window's pooled consumption are admitted through the opportunistic admission gate with a new `fair_share_degraded` traffic class: every account is gated by the preserve-style weekly pace floor and short-window floor instead of the last-account 5% emergency floor, so an over-share key burns the pool's surplus over linear pace but cannot push it behind pace. Keys under their share, lone consumers, and near-empty windows stay foreground. No requests are newly rejected outright; over-share traffic degrades to pace-floor admission with the existing opportunistic denial envelopes.
+- Keys consuming more than `tolerance x 1/k` of a window's pooled consumption are admitted through the opportunistic admission gate with a new `fair_share_degraded` traffic class: every account is gated by the linear pace line of its long window instead of the last-account 5% emergency floor (`preserve` accounts keep their own floors on top), so an over-share key burns the pool's surplus over pace but cannot push it behind pace. Keys under their share, lone consumers, and near-empty windows stay foreground. No requests are newly rejected outright; over-share traffic degrades to pace-floor admission with the existing opportunistic denial envelopes.
+- Two fixes to the existing opportunistic gate apply regardless of the toggle (see design Decision 9): a `preserve` account with no upstream-reported 5h window is gated by its weekly floor alone instead of being refused all opportunistic burn, and `opportunistic_burn_window_closed` becomes a local-overload code so every selection surface returns the `429` rate-limit envelope (previously `503` on the WebSocket/first-turn paths), the denial stays account-health-neutral, and an http-bridge prewarm that hits it is recorded as skipped.
 - No absolute numbers are configured anywhere: `k` is derived from who actually consumed, so adding a user is just creating a key and idle keys (vacation, CI) never distort anyone's share.
 - Explicit `traffic_class: opportunistic` keys, explicit `ApiKeyLimit` rows, and the existing concurrency fair share are unchanged and compose with the new mode.
 
@@ -17,7 +18,7 @@ Teams sharing one codex-lb pool need per-user fairness without per-user configur
 
 ### Modified Capabilities
 
-- `proxy-admission-control`: new requirement for relative fair-share quota admission (classification, `fair_share_degraded` pace-floor gate, windows, defaults).
+- `proxy-admission-control`: new requirement for relative fair-share quota admission (classification, `fair_share_degraded` pace-floor gate, windows, defaults), and a modified "Opportunistic Proxy Traffic Burns Only Safe Quota" requirement for the two toggle-independent gate fixes.
 - `frontend-architecture`: Settings routing section exposes the fair-share quota mode toggle.
 - `database-migrations`: dashboard settings schema gains the fair-share quota mode column with ORM + Alembic coverage.
 
