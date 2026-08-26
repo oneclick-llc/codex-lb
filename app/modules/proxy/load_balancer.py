@@ -957,7 +957,10 @@ class LoadBalancer:
                 )
             if required_continuity_owner and selection_error_code in (None, "hard_affinity_saturated"):
                 selection_error_code = CONTINUITY_OWNER_UNAVAILABLE
-            if traffic_class != TRAFFIC_CLASS_FOREGROUND and error_message and selection_error_code is None:
+            # Catch-all for static opportunistic keys only. Degraded traffic reaches the
+            # burn-window envelope through the prefix-guarded branch above; relabelling its
+            # code-less failures too would report a pool-wide outage as fair-share throttling.
+            if traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC and error_message and selection_error_code is None:
                 return AccountSelection(
                     account=None,
                     error_message=error_message,

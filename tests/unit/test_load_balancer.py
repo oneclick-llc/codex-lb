@@ -6609,3 +6609,61 @@ def test_select_account_fill_first_primary_dominates_over_secondary():
     assert result.account is not None
     # Primary still wins -- only ties break on secondary.
     assert result.account.account_id == "high-secondary"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("traffic_class", "error_message", "expects_burn_window_code"),
+    [
+        ("fair_share_degraded", "No available accounts", False),
+        ("fair_share_degraded", "opportunistic burn window closed: 12% of pooled usage", True),
+        ("opportunistic", "No available accounts", True),
+    ],
+)
+async def test_burn_window_relabel_spares_codeless_fair_share_degraded_failures(
+    traffic_class: str,
+    error_message: str,
+    expects_burn_window_code: bool,
+) -> None:
+    """A pool-wide outage must not reach degraded traffic disguised as fair-share throttling."""
+    from app.modules.proxy._load_balancer.unbound_selection import UnboundSelectionOutcome
+    from app.modules.proxy.load_balancer import OPPORTUNISTIC_BURN_WINDOW_CLOSED, LoadBalancer
+
+    mock_repos = MagicMock()
+    mock_repos.accounts.list_accounts = AsyncMock(return_value=[_make_test_account()])
+    mock_repos.usage.latest_by_account = AsyncMock(return_value={})
+    mock_repos.__aenter__ = AsyncMock(return_value=mock_repos)
+    mock_repos.__aexit__ = AsyncMock(return_value=None)
+    balancer = LoadBalancer(repo_factory=lambda: mock_repos)
+
+    async def _failing_unbound_selection(owner, *, request):
+        return UnboundSelectionOutcome(
+            selection_inputs=request.selection_inputs,
+            selected_snapshot=None,
+            selected_lease=None,
+            error_message=error_message,
+            error_code=None,
+        )
+
+    async def _select(requested_traffic_class: str):
+        with pytest.MonkeyPatch().context() as monkeypatch:
+            monkeypatch.setattr(
+                "app.modules.proxy.load_balancer.run_unbound_selection_path",
+                _failing_unbound_selection,
+            )
+            # Keep the process-global degradation flag out of this test.
+            monkeypatch.setattr("app.modules.proxy.load_balancer.set_degraded", lambda reason=None: None)
+            monkeypatch.setattr("app.modules.proxy.load_balancer.set_normal", lambda: None)
+            return await balancer.select_account(traffic_class=requested_traffic_class)
+
+    selection = await _select(traffic_class)
+
+    if expects_burn_window_code:
+        assert selection.error_code == OPPORTUNISTIC_BURN_WINDOW_CLOSED
+    else:
+        foreground = await _select("foreground")
+        assert selection.error_code != OPPORTUNISTIC_BURN_WINDOW_CLOSED
+        assert (selection.error_code, selection.error_message) == (
+            foreground.error_code,
+            foreground.error_message,
+        )
