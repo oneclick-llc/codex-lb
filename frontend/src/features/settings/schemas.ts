@@ -261,8 +261,9 @@ export const SettingsUpdateRequestSchema = z
   });
 
 type ParsedDashboardSettings = z.infer<typeof DashboardSettingsSchema>;
-type StickyThresholdPresenceFlags = Pick<
+type PresenceFlags = Pick<
   ParsedDashboardSettings,
+  | "__fairShareQuotaModeEnabledProvided"
   | "__stickyReallocationBudgetThresholdPctProvided"
   | "__stickyReallocationPrimaryBudgetThresholdPctProvided"
   | "__stickyReallocationSecondaryBudgetThresholdPctProvided"
@@ -276,9 +277,9 @@ type StickyThresholdValues = Pick<
 
 export type DashboardSettings = Omit<
   ParsedDashboardSettings,
-  keyof StickyThresholdPresenceFlags | keyof StickyThresholdValues
+  keyof PresenceFlags | keyof StickyThresholdValues
 > &
-  Partial<StickyThresholdPresenceFlags> &
+  Partial<PresenceFlags> &
   Partial<StickyThresholdValues>;
 export type SettingsUpdateRequest = z.infer<typeof SettingsUpdateRequestSchema>;
 export type AdditionalQuotaRoutingPolicy = z.infer<typeof AdditionalQuotaRoutingPolicySchema>;
