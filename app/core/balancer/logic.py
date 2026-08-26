@@ -104,12 +104,16 @@ TRAFFIC_CLASS_OPPORTUNISTIC = "opportunistic"
 # last-account emergency floor, so an over-share key cannot push the pool
 # behind pace for the keys it is over-consuming against.
 TRAFFIC_CLASS_FAIR_SHARE_DEGRADED = "fair_share_degraded"
-FAIR_SHARE_WEEKLY_WINDOW_MAX_SECONDS = 10 * SECONDS_PER_DAY
 # An over-share key is cut only once the pool is measurably overdrawn — more
 # than this many percentage points behind linear pace. Without slack the line
 # sits at ~100% on a freshly reset window and blocks degraded keys against
 # accounts that have spent nothing at all.
 FAIR_SHARE_PACE_SLACK_PCT = 10.0
+# A degraded key behind Codex's automatic 429 retry loop re-runs selection on
+# every attempt, so the all-candidates-rejected log is a steady-state condition,
+# not a rare one. One warning per interval per process keeps it diagnosable
+# without flooding.
+FAIR_SHARE_BLOCK_LOG_INTERVAL_SECONDS = 60.0
 PRESERVE_MIN_WEEKLY_FLOOR_PCT = 5.0
 PRESERVE_MIN_SHORT_WINDOW_FLOOR_PCT = 10.0
 NORMAL_LAST_ACCOUNT_EMERGENCY_FLOOR_PCT = 5.0
@@ -134,6 +138,7 @@ class AccountState:
     cooldown_until: float | None = None
     secondary_used_percent: float | None = None
     secondary_reset_at: int | None = None
+    secondary_window_minutes: int | None = None
     last_error_at: float | None = None
     last_selected_at: float | None = None
     error_count: int = 0
@@ -151,9 +156,10 @@ class AccountState:
     leased_tokens: float = 0.0
     routing_policy: str = ROUTING_POLICY_NORMAL
     ignore_standard_quota: bool = False
-    # Selection-ranking pressure (inflight penalty + leased tokens) already
-    # baked into used_percent/secondary_used_percent by the state builder.
-    usage_pressure_pct: float = 0.0
+    # Long-window used percent as reported upstream, before the state builder
+    # adds selection-ranking pressure (inflight penalty + leased tokens) and
+    # clamps to 100. Admission gates judge consumed budget, not parallelism.
+    raw_secondary_used_percent: float | None = None
 
 
 @dataclass
@@ -313,9 +319,23 @@ def _recent_foreground_activity(state: AccountState, current: float) -> bool:
     return state.last_selected_at is not None and current - state.last_selected_at <= RECENT_FOREGROUND_ACTIVITY_SECONDS
 
 
-def _weekly_pace_floor_pct(state: AccountState, current: float) -> float:
+def _long_window_used_pct(state: AccountState, *, raw: bool) -> float | None:
+    """Long-window used percent, optionally before inflight/lease pressure."""
+    if raw and state.raw_secondary_used_percent is not None:
+        return state.raw_secondary_used_percent
+    return _used_pct(state, secondary=True)
+
+
+def _long_window_remaining_pct(state: AccountState, *, raw: bool) -> float | None:
+    used_pct = _long_window_used_pct(state, raw=raw)
+    if used_pct is None:
+        return None
+    return max(0.0, 100.0 - min(100.0, used_pct))
+
+
+def _weekly_pace_floor_pct(state: AccountState, current: float, *, raw_usage: bool = False) -> float:
     remaining_seconds = _seconds_until(state.secondary_reset_at, current)
-    used_pct = _used_pct(state, secondary=True)
+    used_pct = _long_window_used_pct(state, raw=raw_usage)
     if remaining_seconds is None or used_pct is None:
         return 100.0
 
@@ -358,12 +378,22 @@ def _short_window_floor_pct(state: AccountState, current: float, *, preserve_cou
     return floor
 
 
-def _preserve_allows_opportunistic_burn(state: AccountState, current: float, *, preserve_count: int) -> bool:
+def _preserve_allows_opportunistic_burn(
+    state: AccountState,
+    current: float,
+    *,
+    preserve_count: int,
+    raw_usage: bool = False,
+) -> bool:
     # The weekly floor is the core preserve guarantee and requires weekly data.
-    weekly_remaining = _remaining_pct(state, secondary=True)
+    # ``raw_usage`` judges the consumed budget instead of the pressure-inflated
+    # ranking percent: fair-share degraded traffic must not read a burst of
+    # parallel streams on an almost untouched week as consumption. Static
+    # opportunistic traffic keeps the inflated reading it has always used.
+    weekly_remaining = _long_window_remaining_pct(state, raw=raw_usage)
     if weekly_remaining is None or state.secondary_reset_at is None:
         return False
-    if weekly_remaining <= _weekly_pace_floor_pct(state, current):
+    if weekly_remaining <= _weekly_pace_floor_pct(state, current, raw_usage=raw_usage):
         return False
     # The short-window floor gates only while upstream reports a 5h window.
     # With the 5h limit removed upstream no account has a short-window reset
@@ -408,15 +438,14 @@ def _above_emergency_floor(state: AccountState) -> bool:
     )
 
 
-def _fair_share_long_window_pace_remaining_pct(seconds_left: float) -> float:
+def _fair_share_long_window_pace_remaining_pct(seconds_left: float, window_minutes: int | None) -> float | None:
     # The share of the long window still ahead, i.e. what linear pace says
-    # should remain. ponytail: AccountState carries no long-window length, so
-    # infer it from time-to-reset. A weekly window is never longer than 7d and
-    # a monthly one never shorter than ~28d, so split at 10d: right after a
-    # weekly reset upstream may report reset_at a little over 7d ahead, and
-    # reading that as monthly would drop the line to ~23% of a fresh week.
-    window_seconds = SECONDS_PER_WEEK if seconds_left <= FAIR_SHARE_WEEKLY_WINDOW_MAX_SECONDS else 30 * SECONDS_PER_DAY
-    return min(100.0, seconds_left / window_seconds * 100.0)
+    # should remain. The window length is the one upstream reported (weekly or
+    # monthly); without it there is no line to judge against and the caller
+    # fails open rather than guessing a denominator.
+    if window_minutes is None or window_minutes <= 0:
+        return None
+    return min(100.0, seconds_left / (window_minutes * 60) * 100.0)
 
 
 def _fair_share_allows_burn(state: AccountState, current: float) -> bool:
@@ -430,32 +459,53 @@ def _fair_share_allows_burn(state: AccountState, current: float) -> bool:
     # flat short floor was observed cutting degraded keys hard on a pool whose
     # week sat 99% idle just because an earlier burst had drained the 5h
     # window. With no long window reported the gate fails open.
-    long_remaining = _remaining_pct(state, secondary=True)
+    #
+    # The remaining budget is the raw upstream percent: the inflight penalty
+    # (2.5pp per concurrent request) baked into the ranking percents would
+    # otherwise make a highly parallel burst on an idle pool read as a week
+    # burned far behind pace.
+    long_remaining = _long_window_remaining_pct(state, raw=True)
     long_seconds_left = _seconds_until(state.secondary_reset_at, current)
-    if long_remaining is not None and long_seconds_left is not None:
-        # Judge actual consumed budget, not the selection-ranking pressure: the
-        # inflight penalty (2.5pp per concurrent request) is baked into the
-        # state's percents and a highly parallel burst on an idle pool would
-        # otherwise read as a week burned far behind pace.
-        raw_remaining = min(100.0, long_remaining + state.usage_pressure_pct)
-        pace_remaining = _fair_share_long_window_pace_remaining_pct(long_seconds_left)
-        if raw_remaining <= pace_remaining - FAIR_SHARE_PACE_SLACK_PCT:
-            return False
-    return True
+    if long_remaining is None or long_seconds_left is None:
+        return True
+    pace_remaining = _fair_share_long_window_pace_remaining_pct(long_seconds_left, state.secondary_window_minutes)
+    if pace_remaining is None:
+        return True
+    return long_remaining > pace_remaining - FAIR_SHARE_PACE_SLACK_PCT
 
 
 def _fair_share_reject_detail(state: AccountState, current: float) -> str:
-    long_remaining = _remaining_pct(state, secondary=True)
     long_seconds_left = _seconds_until(state.secondary_reset_at, current)
     pace_line = (
-        None if long_seconds_left is None else round(_fair_share_long_window_pace_remaining_pct(long_seconds_left), 1)
+        None
+        if long_seconds_left is None
+        else _fair_share_long_window_pace_remaining_pct(long_seconds_left, state.secondary_window_minutes)
     )
     return (
         f"{state.account_id}[policy={_routing_policy(state)} status={state.status.value} "
-        f"weekly_remaining={long_remaining} pressure={round(state.usage_pressure_pct, 1)} "
-        f"pace_line={pace_line} slack={FAIR_SHARE_PACE_SLACK_PCT} "
+        f"long_remaining_raw={_long_window_remaining_pct(state, raw=True)} "
+        f"long_window_minutes={state.secondary_window_minutes} "
+        f"pace_line={pace_line if pace_line is None else round(pace_line, 1)} "
+        f"slack={FAIR_SHARE_PACE_SLACK_PCT} "
         f"short_remaining={_remaining_pct(state, secondary=False)} "
         f"short_reset_known={_short_window_reset_at(state) is not None}]"
+    )
+
+
+_fair_share_block_logged_at: float | None = None
+
+
+def _log_fair_share_block(rejected: list[AccountState], current: float) -> None:
+    """Report why the pace gate rejected candidates, at most once per interval."""
+    global _fair_share_block_logged_at
+    now = time.monotonic()
+    since_last = None if _fair_share_block_logged_at is None else now - _fair_share_block_logged_at
+    if since_last is not None and since_last < FAIR_SHARE_BLOCK_LOG_INTERVAL_SECONDS:
+        return
+    _fair_share_block_logged_at = now
+    logger.warning(
+        "Fair-share pace gate blocked candidates: %s",
+        "; ".join(_fair_share_reject_detail(state, current) for state in rejected),
     )
 
 
@@ -470,10 +520,17 @@ def _filter_opportunistic_candidates(
     preserve: list[AccountState] = []
     preserve_count = sum(1 for state in available if _routing_policy(state) == ROUTING_POLICY_PRESERVE)
     fair_share = traffic_class == TRAFFIC_CLASS_FAIR_SHARE_DEGRADED
+    pace_rejected: list[AccountState] = []
+
+    def _pace_allows(state: AccountState) -> bool:
+        if _fair_share_allows_burn(state, current):
+            return True
+        pace_rejected.append(state)
+        return False
 
     def _expendable(state: AccountState) -> bool:
         if fair_share:
-            return _fair_share_allows_burn(state, current)
+            return _pace_allows(state)
         return _has_other_usable_foreground_capacity(state, available, current) or _above_emergency_floor(state)
 
     for state in available:
@@ -485,9 +542,9 @@ def _filter_opportunistic_candidates(
             # Preserve floors are flat (15-25% weekly) and can sit below the
             # pace line; an account the operator marked "preserve" must not be
             # the one place an over-share key may dip behind pace.
-            if _preserve_allows_opportunistic_burn(state, current, preserve_count=preserve_count) and (
-                not fair_share or _fair_share_allows_burn(state, current)
-            ):
+            if _preserve_allows_opportunistic_burn(
+                state, current, preserve_count=preserve_count, raw_usage=fair_share
+            ) and (not fair_share or _pace_allows(state)):
                 preserve.append(state)
         else:
             if _expendable(state):
@@ -496,13 +553,11 @@ def _filter_opportunistic_candidates(
     if burn_first or normal or preserve:
         return [*burn_first, *normal, *preserve], None
 
-    if fair_share:
-        # Cold path (every candidate rejected): log why each account failed so
-        # a production denial is diagnosable without database access.
-        logger.warning(
-            "Fair-share pace gate blocked all candidates: %s",
-            "; ".join(_fair_share_reject_detail(state, current) for state in available),
-        )
+    if pace_rejected:
+        # Name the gate that actually rejected. When the pace line cleared every
+        # candidate the blocker is the preserve floor below, and blaming the pace
+        # floor would send operators after the wrong number.
+        _log_fair_share_block(pace_rejected, current)
         return [], "fair-share pace floor blocks over-share burn"
     if any(_routing_policy(state) == ROUTING_POLICY_PRESERVE for state in available):
         return [], "preserve floor or stale usage data blocks opportunistic burn"

@@ -2549,6 +2549,13 @@ def _state_from_account(
     long_window_key = "secondary"
     if effective_secondary_entry is not None and effective_secondary_entry.window == "monthly":
         long_window_key = "monthly"
+    # The pace-line gate needs the long window's actual length; a row that omits
+    # it still identifies its window, so fall back to that window's default.
+    long_window_minutes = (
+        None
+        if effective_secondary_entry is None
+        else (effective_secondary_entry.window_minutes or usage_core.default_window_minutes(long_window_key))
+    )
     capacity_credits = usage_core.capacity_for_plan(account.plan_type, long_window_key) or 0.0
     if capacity_credits > 0.0 and runtime.leased_tokens > 0:
         lease_token_weight = getattr(settings, "proxy_account_lease_token_weight", 1.0)
@@ -2569,7 +2576,8 @@ def _state_from_account(
         cooldown_until=runtime.cooldown_until,
         secondary_used_percent=effective_secondary_used_percent,
         secondary_reset_at=secondary_reset,
-        usage_pressure_pct=pressure_pct,
+        secondary_window_minutes=long_window_minutes,
+        raw_secondary_used_percent=secondary_used,
         last_error_at=runtime.last_error_at,
         last_selected_at=runtime.last_selected_at,
         error_count=runtime.error_count,
