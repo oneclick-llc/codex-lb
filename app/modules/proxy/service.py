@@ -728,7 +728,6 @@ from app.modules.proxy.durable_bridge_coordinator import (
 from app.modules.proxy.durable_bridge_coordinator import (
     DurableBridgeSessionCoordinator,
 )
-from app.modules.proxy.fair_share_quota import resolve_effective_traffic_class
 from app.modules.proxy.helpers import (
     _apply_error_metadata,
     _header_account_id,
@@ -755,6 +754,7 @@ from app.modules.proxy.load_balancer import (
     effective_account_concurrency_caps,
 )
 from app.modules.proxy.repo_bundle import ProxyRepoFactory
+from app.modules.proxy.request_traffic_class import resolve_request_traffic_class
 from app.modules.proxy.ring_membership import (
     RingMembershipService,
 )
@@ -1026,7 +1026,7 @@ class ProxyService(
                 account = await self._select_codex_control_account_without_budget(
                     affinity=affinity,
                     api_key=api_key,
-                    traffic_class=await resolve_effective_traffic_class(api_key, settings=settings),
+                    traffic_class=await resolve_request_traffic_class(api_key, settings=settings),
                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                 )
                 if account is None:
@@ -1766,7 +1766,7 @@ class ProxyService(
         try:
             with anyio.fail_after(remaining_budget):
                 settings = await get_settings_cache().get()
-                effective_traffic_class = await resolve_effective_traffic_class(
+                effective_traffic_class = await resolve_request_traffic_class(
                     api_key, requested=traffic_class, settings=settings
                 )
                 concurrency_caps = effective_account_concurrency_caps(settings)

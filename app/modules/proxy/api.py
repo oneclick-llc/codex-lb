@@ -235,7 +235,7 @@ from app.modules.proxy._service.support import (
 )
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
-from app.modules.proxy.fair_share_quota import fair_share_denial_detail, resolve_effective_traffic_class
+from app.modules.proxy.fair_share_quota import fair_share_denial_detail
 from app.modules.proxy.helpers import _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import parse_forwarded_request
 from app.modules.proxy.images_observability import (
@@ -264,6 +264,7 @@ from app.modules.proxy.request_policy import (
     validate_model_access,
     validate_top_level_compaction_trigger_input_shape,
 )
+from app.modules.proxy.request_traffic_class import resolve_request_traffic_class
 from app.modules.proxy.schemas import (
     AccountPoolUsageResponse,
     CodexModelEntry,
@@ -7775,7 +7776,9 @@ async def _opportunistic_admission_denial(
 ) -> JSONResponse | None:
     if api_key is None:
         return None
-    traffic_class = await resolve_effective_traffic_class(api_key)
+    # Pins the class for the rest of the request: the selection that actually
+    # runs later must not be re-resolved against a newer classifier snapshot.
+    traffic_class = await resolve_request_traffic_class(api_key)
     if traffic_class == TRAFFIC_CLASS_FOREGROUND:
         return None
     selection = await context.service.check_opportunistic_admission(

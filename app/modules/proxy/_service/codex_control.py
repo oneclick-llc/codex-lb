@@ -33,9 +33,9 @@ from app.db.models import Account
 from app.modules.api_keys.service import ApiKeyData
 from app.modules.proxy._service.support import _request_log_client_fields, _RequestLogFailureMetadata
 from app.modules.proxy.affinity import _AffinityPolicy, _sticky_key_for_codex_control_request
-from app.modules.proxy.fair_share_quota import resolve_effective_traffic_class
 from app.modules.proxy.helpers import _header_account_id, _normalize_error_code, _parse_openai_error
 from app.modules.proxy.load_balancer import AccountSelection, effective_account_concurrency_caps
+from app.modules.proxy.request_traffic_class import resolve_request_traffic_class
 from app.modules.proxy.selection_errors import selection_failure_response
 
 logger = logging.getLogger("app.modules.proxy.service")
@@ -333,7 +333,8 @@ class _CodexControlMixin:
                 account = await proxy._select_codex_control_account_without_budget(
                     affinity=affinity,
                     api_key=api_key,
-                    traffic_class=await resolve_effective_traffic_class(api_key, settings=settings),
+                    # Pinned: the selection above already resolved this request's class.
+                    traffic_class=await resolve_request_traffic_class(api_key, settings=settings),
                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                     privacy_policy=effective_privacy_policy,
                 )
