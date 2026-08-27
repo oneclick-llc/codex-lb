@@ -35,6 +35,7 @@ from websockets.frames import Close
 import app.core.clients.proxy as proxy_module
 import app.core.openai.requests as openai_requests_module
 import app.core.resilience.network_recovery as network_recovery_module
+import app.modules.proxy.fair_share_quota as fair_share_quota_module
 import app.modules.proxy.load_balancer as load_balancer_module
 from app.core import shutdown as shutdown_state
 from app.core.auth.refresh import RefreshError
@@ -16046,6 +16047,7 @@ async def test_stream_responses_route_keyed_refresh_connect_settles_before_accou
         yield 'data: {"type":"response.completed","response":{"id":"resp_route_keyed_refresh_ok"}}\n\n'
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(fair_share_quota_module, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
     monkeypatch.setattr(proxy_service, "_STREAM_MAX_ACCOUNT_ATTEMPTS", 2)
     monkeypatch.setattr(streaming_retry_module.ProcessNetworkRecovery, "wait", AsyncMock(return_value=None))
@@ -16130,6 +16132,7 @@ async def test_stream_responses_route_failed_ordered_settlement_retries_release(
         yield 'data: {"type":"response.completed","response":{"id":"resp_route_failed_settlement"}}\n\n'
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(fair_share_quota_module, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
     monkeypatch.setattr(proxy_service, "_STREAM_MAX_ACCOUNT_ATTEMPTS", 2)
     monkeypatch.setattr(proxy_service, "ApiKeysService", FakeApiKeysService)

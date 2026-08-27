@@ -953,9 +953,7 @@ class LoadBalancer:
                 )
             if required_continuity_owner and selection_error_code in (None, "hard_affinity_saturated"):
                 selection_error_code = CONTINUITY_OWNER_UNAVAILABLE
-            # Catch-all for static opportunistic keys only. Degraded traffic reaches the
-            # burn-window envelope through the prefix-guarded branch above; relabelling its
-            # code-less failures too would report a pool-wide outage as fair-share throttling.
+            # Static opportunistic only: relabelling degraded code-less failures reports outages as throttling.
             if traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC and error_message and selection_error_code is None:
                 return AccountSelection(
                     account=None,
@@ -1448,19 +1446,12 @@ class LoadBalancer:
                     error_code=result.error_code,
                     resets_at=result.resets_at,
                 )
-            if result.error_message and result.error_message.startswith("opportunistic burn window closed"):
-                return AccountSelection(
-                    account=None,
-                    error_message=result.error_message,
-                    error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
-                )
-            # Pool-level failure (empty pool, error backoff, paused accounts):
-            # keep the code and message foreground traffic would see, so an
-            # upstream outage is never reported as a closed burn window.
+            # Burn-window code only for filter verdicts; pool failures keep foreground's code.
+            closed = bool(result.error_message and result.error_message.startswith("opportunistic burn window"))
             return AccountSelection(
                 account=None,
                 error_message=result.error_message,
-                error_code=result.error_code,
+                error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED if closed else result.error_code,
             )
         account = account_map.get(result.account.account_id)
         if account is None:
