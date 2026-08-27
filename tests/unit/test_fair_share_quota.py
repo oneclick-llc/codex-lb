@@ -4,7 +4,7 @@ import asyncio
 import json
 from contextlib import asynccontextmanager
 from types import SimpleNamespace
-from typing import cast
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -218,8 +218,10 @@ class TestKeyShares:
     def test_window_shares_sums_the_window_once_for_every_key(self) -> None:
         # Non-consuming active keys get a 0 share against the same fair share.
         shares = fair_share_quota.window_shares({"a": 60.0, "b": 40.0}, ["a", "b", "idle"])
-        assert shares["a"] == fair_share_quota.WindowShare(pytest.approx(0.6), pytest.approx(0.5))
-        assert shares["idle"] == fair_share_quota.WindowShare(0.0, pytest.approx(0.5))
+        assert shares["a"].share == pytest.approx(0.6)
+        assert shares["a"].fair == pytest.approx(0.5)
+        assert shares["idle"].share == 0.0
+        assert shares["idle"].fair == pytest.approx(0.5)
 
     def test_describe_shares_is_human_readable(self) -> None:
         shares = fair_share_quota.KeyShares(
@@ -483,7 +485,7 @@ class TestClassifierCache:
         assert classifier._snapshot is None
         assert classifier._previously_over == frozenset()
         if fair_share_quota.PROMETHEUS_AVAILABLE and fair_share_quota.fair_share_quota_over_share_keys is not None:
-            assert fair_share_quota.fair_share_quota_over_share_keys._value.get() == 0
+            assert cast(Any, fair_share_quota.fair_share_quota_over_share_keys)._value.get() == 0
 
     @pytest.mark.asyncio
     async def test_drain_refresh_cancels_the_background_task(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -524,7 +526,7 @@ class TestSettingsInvalidationCallback:
 
         assert classifier._snapshot is None
         if fair_share_quota.PROMETHEUS_AVAILABLE and fair_share_quota.fair_share_quota_over_share_keys is not None:
-            assert fair_share_quota.fair_share_quota_over_share_keys._value.get() == 0
+            assert cast(Any, fair_share_quota.fair_share_quota_over_share_keys)._value.get() == 0
 
     @pytest.mark.asyncio
     async def test_unrelated_settings_save_keeps_snapshot_while_mode_on(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -665,7 +667,7 @@ class TestAdmissionRoutePath:
     @pytest.mark.asyncio
     async def test_over_share_foreground_key_admitted_into_open_headroom(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._stub_mode(monkeypatch, enabled=True, over_share_ids={"k1"})
-        selection = AccountSelection(account=SimpleNamespace(id="acc"), error_message=None)
+        selection = AccountSelection(account=cast(Any, SimpleNamespace(id="acc")), error_message=None)
         service = SimpleNamespace(check_opportunistic_admission=AsyncMock(return_value=selection))
         context = cast(proxy_api.ProxyContext, SimpleNamespace(service=service))
 

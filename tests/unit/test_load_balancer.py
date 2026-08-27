@@ -19,6 +19,7 @@ from app.core.balancer import (
     ROUTING_POLICY_PRESERVE,
     AccountState,
     RoutingCost,
+    TrafficClass,
     handle_permanent_failure,
     handle_quota_exceeded,
     handle_rate_limit,
@@ -6621,7 +6622,7 @@ def test_select_account_fill_first_primary_dominates_over_secondary():
     ],
 )
 async def test_burn_window_relabel_spares_codeless_fair_share_degraded_failures(
-    traffic_class: str,
+    traffic_class: TrafficClass,
     error_message: str,
     expects_burn_window_code: bool,
 ) -> None:
@@ -6645,7 +6646,7 @@ async def test_burn_window_relabel_spares_codeless_fair_share_degraded_failures(
             error_code=None,
         )
 
-    async def _select(requested_traffic_class: str):
+    async def _select(requested_traffic_class: TrafficClass):
         with pytest.MonkeyPatch().context() as monkeypatch:
             monkeypatch.setattr(
                 "app.modules.proxy.load_balancer.run_unbound_selection_path",

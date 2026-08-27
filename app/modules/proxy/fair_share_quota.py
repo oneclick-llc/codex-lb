@@ -51,7 +51,7 @@ from app.core.metrics.prometheus import (
     fair_share_quota_over_share_keys,
 )
 from app.core.utils.time import utcnow
-from app.db.models import ApiKey, RequestLog, RequestUsageHourlyRollup
+from app.db.models import ApiKey, DashboardSettings, RequestLog, RequestUsageHourlyRollup
 from app.db.session import get_background_session
 from app.modules.accounts.usage_time_rollup import WARMUP_REQUEST_KINDS, from_dimension, to_dimension
 from app.modules.accounts.usage_time_rollup_read import (
@@ -60,7 +60,6 @@ from app.modules.accounts.usage_time_rollup_read import (
     sum_hourly_cost_by_api_key_window,
 )
 from app.modules.api_keys.service import ApiKeyData
-from app.modules.settings.service import DashboardSettingsData
 
 logger = logging.getLogger(__name__)
 
@@ -373,7 +372,7 @@ async def resolve_effective_traffic_class(
     api_key: ApiKeyData | None,
     *,
     requested: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
-    settings: DashboardSettingsData | None = None,
+    settings: DashboardSettings | None = None,
 ) -> TrafficClass:
     """Admission-time traffic class: static key class, else fair-share verdict.
 

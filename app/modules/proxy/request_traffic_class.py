@@ -23,9 +23,9 @@ from contextvars import ContextVar
 
 from app.core.balancer import TRAFFIC_CLASS_FOREGROUND, TrafficClass
 from app.core.utils.request_id import get_request_id
+from app.db.models import DashboardSettings
 from app.modules.api_keys.service import ApiKeyData
 from app.modules.proxy.fair_share_quota import resolve_effective_traffic_class
-from app.modules.settings.service import DashboardSettingsData
 
 _PINNED: ContextVar[tuple[tuple[str, str], TrafficClass] | None] = ContextVar(
     "proxy_request_traffic_class", default=None
@@ -36,7 +36,7 @@ async def resolve_request_traffic_class(
     api_key: ApiKeyData | None,
     *,
     requested: TrafficClass = TRAFFIC_CLASS_FOREGROUND,
-    settings: DashboardSettingsData | None = None,
+    settings: DashboardSettings | None = None,
 ) -> TrafficClass:
     """Effective traffic class for the current request, pinned at first resolution.
 
