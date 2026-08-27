@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 
 import { buildSettingsUpdateRequest } from "@/features/settings/payload";
 import { DashboardSettingsSchema } from "@/features/settings/schemas";
+import { createDashboardSettings } from "@/test/mocks/factories";
 
 describe("buildSettingsUpdateRequest", () => {
   it("carries the loaded settings version as expectedVersion for CAS", () => {
@@ -331,5 +332,17 @@ describe("buildSettingsUpdateRequest", () => {
     const payload = buildSettingsUpdateRequest(settings, { stickyThreadsEnabled: false });
 
     expect(payload.fairShareQuotaModeEnabled).toBe(true);
+  });
+
+  it("preserves explicit null capacity clears in the update payload", () => {
+    const settings = createDashboardSettings();
+    const payload = buildSettingsUpdateRequest(settings, {
+      proxyAccountStreamLimit: null,
+    });
+
+    expect(payload.proxyAccountStreamLimit).toBeNull();
+    expect(payload).not.toHaveProperty("proxyAccountResponseCreateLimit");
+    expect(payload).not.toHaveProperty("proxyAccountStreamRecoveryReserve");
+    expect(payload).not.toHaveProperty("proxyApiKeyFairShareCongestionThresholdPct");
   });
 });

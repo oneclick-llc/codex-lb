@@ -9,6 +9,7 @@ from typing import Any, TypeVar, cast
 
 import anyio
 
+from app.core.balancer.types import UpstreamError
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
 from app.core.clients.files import finalize_file as core_finalize_file  # noqa: F401
 from app.core.clients.proxy import CodexControlResponse as CodexControlResponse
@@ -49,6 +50,7 @@ from app.core.usage.live_hub import publish_live_usage
 from app.core.usage.live_snapshots import EVENT_MARKER, parse_rate_limit_event_text
 from app.core.utils.request_id import reset_request_id, set_request_id
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
+from app.db.models import Account
 from app.modules.proxy._service.api_key_usage import (
     _API_KEY_RESERVATION_HEARTBEAT_SECONDS as _API_KEY_RESERVATION_HEARTBEAT_SECONDS,
 )
@@ -145,6 +147,7 @@ from app.modules.proxy._service.support import (
     _clear_websocket_deferred_reasoning_downstream_texts,
     _clear_websocket_precreated_replay_fallback,
     _clear_websocket_request_error_overrides,
+    _DeferredKeyedStreamHealthPenalty,
     _HTTPBridgeCompletedDeliveryScope,
     _HTTPBridgeRetryCircuitAttemptSelection,
     _HTTPBridgeSession,
@@ -359,6 +362,24 @@ async def _persist_http_bridge_operation_event(
     append_event = getattr(getattr(service, "_durable_bridge", None), "append_operation_event", None)
     if not operation_id or session_id is None or owner_epoch is None:
         return False
+    append_barrier_released = False
+    delivery_barrier_released = False
+    terminal_enqueued = False
+
+    async def release_terminal_append_barrier() -> None:
+        nonlocal append_barrier_released
+        if terminal_append_barrier is None or append_barrier_released:
+            return
+        append_barrier_released = True
+        await terminal_append_barrier()
+
+    async def release_terminal_delivery_barrier() -> None:
+        nonlocal delivery_barrier_released
+        if terminal_delivery_barrier is None or delivery_barrier_released:
+            return
+        delivery_barrier_released = True
+        await terminal_delivery_barrier()
+
     try:
         batcher = getattr(service, "_http_bridge_operation_event_batcher", None)
         append_terminal_batch = getattr(batcher, "append_terminal_event", None)
@@ -416,14 +437,16 @@ async def _persist_http_bridge_operation_event(
                 ),
                 name=f"http-bridge-terminal-append-{operation_id}",
             )
-            append_result, deferred_cancellation = await _await_task_deferring_cancellation(append_task)
-            if terminal_append_barrier is not None:
-                await terminal_append_barrier()
+            # Counted grouped siblings wait on this barrier; release it even when
+            # append raises so gather(..., return_exceptions=True) cannot strand them.
+            try:
+                append_result, deferred_cancellation = await _await_task_deferring_cancellation(append_task)
+            finally:
+                await release_terminal_append_barrier()
             persisted = bool(append_result)
             if not persisted:
                 logger.info("HTTP bridge terminal event spool became incomplete operation_id=%s", operation_id)
             settlement_required = bool(getattr(append_result, "settlement_required", False))
-            terminal_enqueued = False
             if settlement_required:
                 terminal_enqueued, delivery_cancellation = await enqueue_terminal_delivery_deferring_cancellation()
                 deferred_cancellation = deferred_cancellation or delivery_cancellation
@@ -431,7 +454,7 @@ async def _persist_http_bridge_operation_event(
                 if not terminal_enqueued:
                     terminal_enqueued, delivery_cancellation = await enqueue_terminal_delivery_deferring_cancellation()
                     deferred_cancellation = deferred_cancellation or delivery_cancellation
-                await terminal_delivery_barrier()
+                await release_terminal_delivery_barrier()
             if settlement_required:
                 settle_terminal_batch = getattr(batcher, "settle_terminal_event", None)
 
@@ -510,7 +533,23 @@ async def _persist_http_bridge_operation_event(
         # when every event was durably persisted, so never fail a live stream
         # because the optional spool is unavailable.
         logger.warning("Failed to persist HTTP bridge operation event operation_id=%s", operation_id, exc_info=True)
-        return False
+        await release_terminal_append_barrier()
+        if terminal_event_queue is not None and terminal and not terminal_enqueued:
+            try:
+                await terminal_event_queue.put(event_block)
+                await terminal_event_queue.put(None)
+                if terminal_delivery_scope is not None:
+                    async with session.pending_lock:
+                        terminal_delivery_scope.terminal_enqueued = True
+                terminal_enqueued = True
+            except Exception:
+                logger.debug(
+                    "Failed to enqueue HTTP bridge terminal after spool error operation_id=%s",
+                    operation_id,
+                    exc_info=True,
+                )
+        await release_terminal_delivery_barrier()
+        return terminal_enqueued
 
 
 async def _wait_for_http_bridge_recovery_settlement_retry(
@@ -1749,6 +1788,35 @@ class _HTTPBridgeUpstreamEventsMixin:
                     except asyncio.QueueFull:
                         pass
 
+    async def _handle_or_defer_precreated_stream_health(
+        self: Any,
+        request_state: _WebSocketRequestState | None,
+        account: Account,
+        error: UpstreamError,
+        code: str,
+    ) -> None:
+        """Write account health now, or defer it until reservation settlement.
+
+        Keyed pre-created retry branches run while the request's API-key
+        reservation is still open. An immediate ``_handle_stream_error`` would
+        mutate account health before the reservation settles, violating the
+        settlement-ordering invariant (api-keys spec: the health write waits
+        for settlement, and unconfirmed settlement leaves health unapplied).
+        Queue the classified write on the request state instead;
+        ``_drain_deferred_keyed_stream_health`` applies it after settlement or
+        fallback release commits. Unkeyed requests keep the immediate write.
+        ``account_health_error_handled`` is set either way so terminal
+        finalization does not apply a duplicate penalty.
+        """
+        if request_state is not None and request_state.api_key_reservation is not None:
+            request_state.deferred_keyed_stream_health.append(
+                _DeferredKeyedStreamHealthPenalty(account=account, error=error, code=code)
+            )
+        else:
+            await self._handle_stream_error(account, error, code)
+        if request_state is not None:
+            setattr(request_state, "account_health_error_handled", True)
+
     async def _process_parsed_http_bridge_upstream_event(
         self: Any,
         session: "_HTTPBridgeSession",
@@ -2362,12 +2430,12 @@ class _HTTPBridgeUpstreamEventsMixin:
                     status_request_state.response_id = None
             if status_request_state.propagate_http_errors:
                 _signal_http_bridge_capacity_startup_wait(status_request_state)
-            await self._handle_stream_error(
+            await self._handle_or_defer_precreated_stream_health(
+                status_request_state,
                 session.account,
                 {"message": retry_error_message or "Upstream error"},
                 retry_error_code,
             )
-            setattr(status_request_state, "account_health_error_handled", True)
             retry_consumer_attached = (
                 retry_consumer_attached
                 and status_request_state.event_queue is not None
@@ -2428,13 +2496,12 @@ class _HTTPBridgeUpstreamEventsMixin:
                         if _http_bridge_request_counts_against_queue(status_request_state):
                             session.queued_request_count = max(0, session.queued_request_count - 1)
         elif owner_pinned_quota_error is not None and not is_previous_response_not_found_event:
-            await self._handle_stream_error(
+            await self._handle_or_defer_precreated_stream_health(
+                status_request_state,
                 session.account,
                 {"message": retry_error_message or "Upstream error"},
                 owner_pinned_quota_error,
             )
-            if status_request_state is not None:
-                setattr(status_request_state, "account_health_error_handled", True)
             if (
                 status_request_state is not None
                 and status_request_state.previous_response_id is not None
@@ -2554,13 +2621,12 @@ class _HTTPBridgeUpstreamEventsMixin:
             and retry_error_code != _ACCOUNT_MODEL_UNSUPPORTED_ERROR_CODE
             and not is_previous_response_not_found_event
         ):
-            await self._handle_stream_error(
+            await self._handle_or_defer_precreated_stream_health(
+                status_request_state,
                 session.account,
                 {"message": retry_error_message or "Upstream error"},
                 retry_error_code,
             )
-            if status_request_state is not None:
-                setattr(status_request_state, "account_health_error_handled", True)
             if status_request_state is not None and status_request_state.previous_response_id is None:
                 async with session.pending_lock:
                     if status_request_state not in session.pending_requests:
@@ -2781,8 +2847,14 @@ class _HTTPBridgeUpstreamEventsMixin:
             and terminal_request_state.request_kind != "prewarm"
             and not terminal_request_state.skip_request_log
         ):
-            await self._clear_http_bridge_retry_circuit(session)
-            _clear_http_bridge_quarantine(self, session)
+            if not terminal_request_state.verified_stale_anchor_replay:
+                await self._clear_http_bridge_retry_circuit(session)
+            _clear_http_bridge_quarantine(
+                self,
+                session,
+                additional_key=terminal_request_state.verified_stale_anchor_retry_circuit_key,
+                additional_key_generation=terminal_request_state.verified_stale_anchor_quarantine_generation,
+            )
 
         normalize_error_event = (
             terminal_request_state is None or terminal_request_state.enforce_openai_sdk_contract
