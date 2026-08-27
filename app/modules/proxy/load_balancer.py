@@ -1452,10 +1452,19 @@ class LoadBalancer:
                     error_code=result.error_code,
                     resets_at=result.resets_at,
                 )
+            if result.error_message and result.error_message.startswith("opportunistic burn window closed"):
+                return AccountSelection(
+                    account=None,
+                    error_message=result.error_message,
+                    error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
+                )
+            # Pool-level failure (empty pool, error backoff, paused accounts):
+            # keep the code and message foreground traffic would see, so an
+            # upstream outage is never reported as a closed burn window.
             return AccountSelection(
                 account=None,
                 error_message=result.error_message,
-                error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
+                error_code=result.error_code,
             )
         account = account_map.get(result.account.account_id)
         if account is None:

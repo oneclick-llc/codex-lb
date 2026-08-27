@@ -681,6 +681,23 @@ class TestAdmissionRoutePath:
         assert gate_kwargs["traffic_class"] == TRAFFIC_CLASS_FAIR_SHARE_DEGRADED
 
     @pytest.mark.asyncio
+    async def test_pool_level_failure_falls_through_to_normal_selection(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # Empty pool / error backoff is not a gate verdict: the gate must not
+        # deny (the normal selection path will fail with the same pool-level
+        # error foreground traffic gets).
+        self._stub_mode(monkeypatch, enabled=True, over_share_ids={"k1"})
+        selection = AccountSelection(account=None, error_message="No available accounts", error_code=None)
+        service = SimpleNamespace(check_opportunistic_admission=AsyncMock(return_value=selection))
+        context = cast(proxy_api.ProxyContext, SimpleNamespace(service=service))
+
+        response = await proxy_api._opportunistic_admission_denial(
+            self._request(), context, _make_api_key("k1"), model="gpt-5.1"
+        )
+
+        assert response is None
+        service.check_opportunistic_admission.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_mode_off_foreground_key_bypasses_gate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._stub_mode(monkeypatch, enabled=False, over_share_ids={"k1"})
         service = SimpleNamespace(check_opportunistic_admission=AsyncMock())

@@ -244,6 +244,7 @@ from app.modules.proxy.images_observability import (
     IMAGE_ROUTE_STREAM_STATE,
     record_images_route_observability,
 )
+from app.modules.proxy.load_balancer import OPPORTUNISTIC_BURN_WINDOW_CLOSED
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_api_key_enforcement_to_chat_payload,
@@ -7788,6 +7789,11 @@ async def _opportunistic_admission_denial(
         traffic_class=traffic_class,
     )
     if selection.account is not None:
+        return None
+    if selection.error_code not in (USAGE_LIMIT_REACHED, OPPORTUNISTIC_BURN_WINDOW_CLOSED):
+        # Not a gate verdict (empty pool, backoff, paused accounts): let the
+        # request proceed to normal selection, which fails with the same
+        # pool-level error foreground traffic gets.
         return None
     if selection.error_code == USAGE_LIMIT_REACHED:
         return _logged_error_json_response(
