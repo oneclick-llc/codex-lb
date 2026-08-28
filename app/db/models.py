@@ -869,6 +869,12 @@ class DashboardSettings(Base):
         Integer,
         nullable=True,
     )
+    fair_share_quota_mode_enabled: Mapped[bool] = mapped_column(
+        Boolean,
+        default=False,
+        server_default=false(),
+        nullable=False,
+    )
     prefer_earlier_reset_accounts: Mapped[bool] = mapped_column(
         Boolean, default=True, server_default=true(), nullable=False
     )

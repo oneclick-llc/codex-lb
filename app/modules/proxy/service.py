@@ -757,6 +757,7 @@ from app.modules.proxy.load_balancer import (
     effective_account_concurrency_caps,
 )
 from app.modules.proxy.repo_bundle import ProxyRepoFactory
+from app.modules.proxy.request_traffic_class import resolve_request_traffic_class
 from app.modules.proxy.ring_membership import (
     RingMembershipService,
 )
@@ -1008,9 +1009,7 @@ class ProxyService(
                 account = await self._select_codex_control_account_without_budget(
                     affinity=affinity,
                     api_key=api_key,
-                    traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC
-                    if api_key is not None and api_key.traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC
-                    else TRAFFIC_CLASS_FOREGROUND,
+                    traffic_class=await resolve_request_traffic_class(api_key, settings=settings),
                     prefer_earlier_reset_window=_prefer_earlier_reset_window(settings),
                 )
                 if account is None:
@@ -1720,11 +1719,6 @@ class ProxyService(
             if api_key is not None and api_key.account_assignment_scope_enabled
             else None
         )
-        effective_traffic_class = (
-            TRAFFIC_CLASS_OPPORTUNISTIC
-            if api_key is not None and api_key.traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC
-            else traffic_class
-        )
         excluded_account_ids_set = set(exclude_account_ids or ())
 
         def log_account_id(account_id: str | None) -> str | None:
@@ -1755,6 +1749,9 @@ class ProxyService(
         try:
             with anyio.fail_after(remaining_budget):
                 settings = await get_settings_cache().get()
+                effective_traffic_class = await resolve_request_traffic_class(
+                    api_key, requested=traffic_class, settings=settings
+                )
                 concurrency_caps = effective_account_concurrency_caps(settings)
                 stream_reserve_slots = (
                     (
@@ -2020,6 +2017,7 @@ class ProxyService(
         api_key: ApiKeyData | None,
         model: str | None,
         lease_kind: AccountLeaseKind | None = None,
+        traffic_class: TrafficClass = TRAFFIC_CLASS_OPPORTUNISTIC,
     ) -> AccountSelection:
         settings = await get_settings_cache().get()
         scoped_account_ids = (
@@ -2056,6 +2054,7 @@ class ProxyService(
                 if lease_kind == "stream"
                 else 0
             ),
+            traffic_class=traffic_class,
         )
 
     async def _handle_proxy_error(

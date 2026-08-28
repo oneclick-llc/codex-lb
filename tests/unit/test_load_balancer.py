@@ -19,6 +19,7 @@ from app.core.balancer import (
     ROUTING_POLICY_PRESERVE,
     AccountState,
     RoutingCost,
+    TrafficClass,
     handle_permanent_failure,
     handle_quota_exceeded,
     handle_rate_limit,
@@ -601,6 +602,510 @@ def test_opportunistic_preserve_skips_when_weekly_floor_would_be_crossed():
     )
 
 
+_FAIR_SHARE_BLOCKED = "opportunistic burn window closed: fair-share pace floor blocks over-share burn"
+_PRESERVE_BLOCKED = "opportunistic burn window closed: preserve floor or stale usage data blocks opportunistic burn"
+_WEEKLY_WINDOW_MINUTES = usage_core.default_window_minutes("secondary")
+_MONTHLY_WINDOW_MINUTES = usage_core.default_window_minutes("monthly")
+
+
+def test_fair_share_degraded_hits_pace_line_where_opportunistic_still_burns():
+    now = 1_700_000_000.0
+
+    def _states():
+        # 20% left on both windows, 3 days to reset (weekly pace line 33%):
+        # static opportunistic may burn down to the 5% emergency floor, a
+        # fair-share-degraded key may not.
+        return [
+            AccountState(
+                "normal",
+                AccountStatus.ACTIVE,
+                used_percent=80.0,
+                reset_at=now + 3 * 3600,
+                secondary_used_percent=80.0,
+                secondary_reset_at=int(now + 3 * 24 * 3600),
+                secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+                routing_policy="normal",
+            )
+        ]
+
+    opportunistic = select_account(_states(), now=now, routing_strategy="usage_weighted", traffic_class="opportunistic")
+    assert opportunistic.account is not None
+
+    degraded = select_account(
+        _states(), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert degraded.account is None
+    assert degraded.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_degraded_pace_floor_applies_to_every_normal_account():
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            name,
+            AccountStatus.ACTIVE,
+            used_percent=85.0,
+            reset_at=now + 3 * 3600,
+            secondary_used_percent=85.0,
+            secondary_reset_at=int(now + 3 * 24 * 3600),
+            secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+            routing_policy="normal",
+        )
+        for name in ("normal-a", "normal-b")
+    ]
+
+    # With two normal accounts opportunistic traffic always has "other usable
+    # foreground capacity" and burns freely; fair share does not.
+    assert select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="opportunistic").account
+    degraded = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+    assert degraded.account is None
+    assert degraded.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_degraded_ignores_drained_5h_window_when_week_is_idle():
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            # An earlier burst drained the 5h window, but the week is 99% idle:
+            # the degraded key must NOT be cut (observed complaint: hard 429s on
+            # an almost untouched pool for hours after a colleague's burst).
+            used_percent=85.0,
+            reset_at=now + 3 * 3600,
+            secondary_used_percent=1.0,
+            secondary_reset_at=int(now + 5 * 24 * 3600),
+            secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+            routing_policy="normal",
+            last_selected_at=now - 60,
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is not None
+    assert result.account.account_id == "normal"
+
+
+def test_fair_share_degraded_burns_surplus_when_pool_is_behind_pace():
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=50.0,
+            reset_at=now + 3 * 3600,
+            # One day left in the week with only 10% used: far ahead of linear
+            # pace (14% should remain, 90% does), the surplus is expendable —
+            # even though the account is in active foreground use.
+            secondary_used_percent=10.0,
+            secondary_reset_at=int(now + 24 * 3600),
+            secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+            routing_policy="normal",
+            last_selected_at=now - 60,
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is not None
+    assert result.account.account_id == "normal"
+
+
+def test_fair_share_block_logs_per_account_diagnostics(caplog, monkeypatch):
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.core.balancer.logic._fair_share_block_logged_at", None)
+    states = [
+        AccountState(
+            "acc-diag",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            secondary_used_percent=70.0,
+            secondary_reset_at=int(now + 3 * 24 * 3600),
+            secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+            routing_policy="normal",
+        )
+    ]
+
+    with caplog.at_level("WARNING", logger="app.core.balancer.logic"):
+        result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is None
+    blocked = [r.getMessage() for r in caplog.records if "Fair-share pace gate blocked" in r.getMessage()]
+    assert len(blocked) == 1
+    assert (
+        "acc-diag[policy=normal status=active long_remaining_raw=30.0 long_window_minutes=10080 "
+        "pace_line=42.9 slack=10.0" in blocked[0]
+    )
+
+
+def test_fair_share_block_warning_is_throttled_per_process(caplog, monkeypatch):
+    # Every denied request re-runs selection at least twice and Codex retries
+    # 429s automatically, so an expected steady-state denial must not flood the
+    # log with one warning per attempt.
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.core.balancer.logic._fair_share_block_logged_at", None)
+    states = [
+        AccountState(
+            "acc-loop",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            secondary_used_percent=70.0,
+            secondary_reset_at=int(now + 3 * 24 * 3600),
+            secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+            routing_policy="normal",
+        )
+    ]
+
+    with caplog.at_level("WARNING", logger="app.core.balancer.logic"):
+        for _ in range(20):
+            assert (
+                select_account(
+                    states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+                ).account
+                is None
+            )
+
+    blocked = [r.getMessage() for r in caplog.records if "Fair-share pace gate blocked" in r.getMessage()]
+    assert len(blocked) == 1
+
+
+def test_fair_share_gate_ignores_inflight_pressure_on_idle_week():
+    now = 1_700_000_000.0
+
+    def _state(effective_used: float, raw_used: float):
+        # A highly parallel burst bakes 2.5pp per inflight request into the
+        # state's percents; the pace gate must judge the raw consumed budget.
+        return [
+            AccountState(
+                "normal",
+                AccountStatus.ACTIVE,
+                used_percent=0.0,
+                reset_at=None,
+                secondary_used_percent=effective_used,
+                secondary_reset_at=int(now + 6.9 * 24 * 3600),
+                secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+                routing_policy="normal",
+                raw_secondary_used_percent=raw_used,
+            )
+        ]
+
+    # Real weekly usage 1%, 30 parallel streams (+75pp effective): admitted.
+    pressured = select_account(
+        _state(76.0, 1.0), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert pressured.account is not None
+
+    # The same effective percent from genuine consumption: blocked.
+    burned = select_account(
+        _state(76.0, 76.0), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert burned.account is None
+    assert burned.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_gate_survives_pressure_clamped_to_100_percent():
+    # True weekly usage 95% with 8 concurrent streams (+20pp): the state builder
+    # clamps the ranking percent to 100, so reconstructing the raw value by
+    # adding the pressure back reads 20% remaining against an 18.6% cut and
+    # wrongly admits. The raw percent must be carried, not reconstructed.
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            secondary_used_percent=100.0,
+            raw_secondary_used_percent=95.0,
+            secondary_reset_at=int(now + 2 * 24 * 3600),
+            secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+            routing_policy="normal",
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is None
+    assert result.error_message == _FAIR_SHARE_BLOCKED
+
+
+@pytest.mark.parametrize(
+    ("window_minutes", "admitted"),
+    [
+        # 9 days out with 33% left is exactly on monthly pace (30% due to
+        # remain, slack 10pp): a monthly-plan account must not be cut...
+        (_MONTHLY_WINDOW_MINUTES, True),
+        # ...while the same clock on a weekly window is a fully spent week.
+        (_WEEKLY_WINDOW_MINUTES, False),
+    ],
+)
+def test_fair_share_pace_line_uses_the_reported_long_window_length(window_minutes, admitted):
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            secondary_used_percent=67.0,
+            secondary_reset_at=int(now + 9 * 24 * 3600),
+            secondary_window_minutes=window_minutes,
+            routing_policy="normal",
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert (result.account is not None) is admitted
+
+
+def test_fair_share_gate_fails_open_without_a_reported_window_length():
+    # No long-window length reported: there is no pace line to judge against,
+    # and the gate fails open rather than guessing a denominator.
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            secondary_used_percent=95.0,
+            secondary_reset_at=int(now + 2 * 24 * 3600),
+            secondary_window_minutes=None,
+            routing_policy="normal",
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is not None
+
+
+def test_fair_share_degraded_untouched_fresh_week_never_blocks():
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            # Weekly window just reset, nothing spent: the pace line sits at
+            # 100% and without slack would block against an untouched account.
+            secondary_used_percent=0.0,
+            secondary_reset_at=int(now + 7 * 24 * 3600),
+            secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+            routing_policy="normal",
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is not None
+
+
+def test_fair_share_degraded_fresh_week_reported_slightly_over_7d_is_still_weekly():
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            # Right after the weekly reset upstream reports reset_at a minute
+            # past 7d. The pace line clamps at 100% of the reported weekly
+            # window, so a quarter of the fresh week is already >10pp behind.
+            secondary_used_percent=25.0,
+            secondary_reset_at=int(now + 7 * 24 * 3600 + 60),
+            secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+            routing_policy="normal",
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert result.account is None
+    assert result.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_degraded_preserve_account_also_requires_pace_surplus():
+    now = 1_700_000_000.0
+
+    def _states():
+        # 70% left with 6 days to go: above the flat preserve floors (15% / 20%),
+        # but behind the 86% pace line.
+        return [
+            AccountState(
+                "review",
+                AccountStatus.ACTIVE,
+                used_percent=30.0,
+                reset_at=now + 3 * 3600,
+                secondary_used_percent=30.0,
+                secondary_reset_at=int(now + 6 * 24 * 3600),
+                secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+                routing_policy="preserve",
+            )
+        ]
+
+    opportunistic = select_account(_states(), now=now, routing_strategy="usage_weighted", traffic_class="opportunistic")
+    assert opportunistic.account is not None
+
+    degraded = select_account(
+        _states(), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert degraded.account is None
+    assert degraded.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_denial_names_the_preserve_floor_when_the_pace_gate_passed():
+    now = 1_700_000_000.0
+
+    def _states():
+        # One day left with 10% of the week remaining: above the 14% pace line
+        # less the 10pp slack, so the pace gate admits — the flat 15% preserve
+        # floor is what rejects. Naming the pace floor here sends operators
+        # after the wrong number.
+        return [
+            AccountState(
+                "review",
+                AccountStatus.ACTIVE,
+                used_percent=0.0,
+                reset_at=None,
+                secondary_used_percent=90.0,
+                secondary_reset_at=int(now + 24 * 3600),
+                secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+                routing_policy="preserve",
+            )
+        ]
+
+    for traffic_class in ("opportunistic", "fair_share_degraded"):
+        result = select_account(_states(), now=now, routing_strategy="usage_weighted", traffic_class=traffic_class)
+        assert result.account is None, traffic_class
+        assert result.error_message == _PRESERVE_BLOCKED, traffic_class
+
+
+def test_fair_share_preserve_floor_ignores_inflight_pressure():
+    now = 1_700_000_000.0
+
+    def _states():
+        # 1% of the week consumed with 30 parallel streams (+75pp) on an
+        # actively used preserve account: the flat 25% recent-activity floor
+        # reads the inflated percent as consumption and rejects an almost
+        # untouched pool. Degraded traffic must judge the raw percent.
+        return [
+            AccountState(
+                "review",
+                AccountStatus.ACTIVE,
+                used_percent=0.0,
+                reset_at=None,
+                secondary_used_percent=76.0,
+                raw_secondary_used_percent=1.0,
+                secondary_reset_at=int(now + 6 * 24 * 3600),
+                secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+                routing_policy="preserve",
+                last_selected_at=now - 60,
+            )
+        ]
+
+    degraded = select_account(
+        _states(), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert degraded.account is not None
+
+    # Static opportunistic traffic keeps the numbers it has always used.
+    opportunistic = select_account(_states(), now=now, routing_strategy="usage_weighted", traffic_class="opportunistic")
+    assert opportunistic.account is None
+    assert opportunistic.error_message == _PRESERVE_BLOCKED
+
+
+@pytest.mark.parametrize(
+    ("weekly_used", "days_left", "admitted"),
+    [
+        # remaining 40% vs pace 43%: 3pp behind is within the 10pp slack.
+        (60.0, 3.0, True),
+        # remaining 30% vs pace 43%: 13pp behind pace, genuinely overdrawn.
+        (70.0, 3.0, False),
+        # Last day: pace 14%; 10% left is within slack, 3% is not.
+        (90.0, 1.0, True),
+        (97.0, 1.0, False),
+        # Last hour: the slack exceeds the remaining pace line, never blocked.
+        (99.0, 1.0 / 24.0, True),
+    ],
+)
+def test_fair_share_degraded_weekly_reserve_follows_linear_pace(weekly_used, days_left, admitted):
+    now = 1_700_000_000.0
+    states = [
+        AccountState(
+            "normal",
+            AccountStatus.ACTIVE,
+            used_percent=0.0,
+            reset_at=None,
+            secondary_used_percent=weekly_used,
+            secondary_reset_at=int(now + days_left * 24 * 3600),
+            secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+            routing_policy="normal",
+            last_selected_at=now - 60,
+        )
+    ]
+
+    result = select_account(states, now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded")
+
+    assert (result.account is not None) is admitted
+    if not admitted:
+        assert result.error_message == _FAIR_SHARE_BLOCKED
+
+
+def test_fair_share_degraded_fails_open_on_unknown_usage():
+    now = 1_700_000_000.0
+
+    def _states():
+        return [AccountState("fresh", AccountStatus.ACTIVE, routing_policy="normal")]
+
+    # Static opportunistic cannot prove an emergency reserve on a fresh account...
+    opportunistic = select_account(_states(), now=now, routing_strategy="usage_weighted", traffic_class="opportunistic")
+    assert opportunistic.account is None
+
+    # ...but a degraded foreground key must not be 429'd while foreground passes.
+    degraded = select_account(
+        _states(), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert degraded.account is not None
+    assert degraded.account.account_id == "fresh"
+
+
+def test_fair_share_degraded_weekly_floor_binds_without_a_5h_window():
+    now = 1_700_000_000.0
+
+    def _states(weekly_used: float):
+        # Upstream stopped reporting the 5h window (reset_at None, primary 0):
+        # only the weekly window exists, and it must still gate.
+        return [
+            AccountState(
+                "normal",
+                AccountStatus.ACTIVE,
+                used_percent=0.0,
+                reset_at=None,
+                secondary_used_percent=weekly_used,
+                secondary_reset_at=int(now + 3 * 24 * 3600),
+                secondary_window_minutes=_WEEKLY_WINDOW_MINUTES,
+                routing_policy="normal",
+            )
+        ]
+
+    healthy = select_account(
+        _states(50.0), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert healthy.account is not None
+
+    tight = select_account(
+        _states(90.0), now=now, routing_strategy="usage_weighted", traffic_class="fair_share_degraded"
+    )
+    assert tight.account is None
+    assert tight.error_message == _FAIR_SHARE_BLOCKED
+
+
 def test_opportunistic_preserve_skips_when_short_window_floor_would_be_crossed():
     now = 1_700_000_000.0
     states = [
@@ -621,6 +1126,34 @@ def test_opportunistic_preserve_skips_when_short_window_floor_would_be_crossed()
     assert result.error_message == (
         "opportunistic burn window closed: preserve floor or stale usage data blocks opportunistic burn"
     )
+
+
+def test_preserve_without_reported_5h_window_gates_on_weekly_floor_alone():
+    now = 1_700_000_000.0
+
+    def _states(weekly_used: float):
+        # Upstream stopped reporting the 5h window entirely: reset_at is None
+        # on every account. Preserve must fall back to the weekly floor, not
+        # block all opportunistic burn forever.
+        return [
+            AccountState(
+                "review",
+                AccountStatus.ACTIVE,
+                used_percent=0.0,
+                reset_at=None,
+                secondary_used_percent=weekly_used,
+                secondary_reset_at=int(now + 3 * 24 * 3600),
+                routing_policy="preserve",
+            )
+        ]
+
+    for traffic_class in ("opportunistic", "fair_share_degraded"):
+        healthy = select_account(_states(1.0), now=now, routing_strategy="usage_weighted", traffic_class=traffic_class)
+        assert healthy.account is not None, traffic_class
+
+    # The weekly preserve floor itself still binds (15% floor, 10% remaining).
+    floored = select_account(_states(90.0), now=now, routing_strategy="usage_weighted", traffic_class="opportunistic")
+    assert floored.account is None
 
 
 def test_opportunistic_preserve_weekly_floor_decreases_near_reset_when_pace_is_behind():
@@ -2537,6 +3070,57 @@ def test_state_from_account_expires_stale_partial_secondary_usage_after_reset(mo
 
     assert state.secondary_used_percent == 0.0
     assert state.secondary_reset_at is None
+
+
+def test_state_from_account_carries_raw_long_window_usage_and_length(monkeypatch):
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+
+    state = _state_from_account(
+        account=_make_test_account(status=AccountStatus.ACTIVE),
+        primary_entry=None,
+        secondary_entry=_make_test_usage(
+            window="secondary",
+            used_percent=95.0,
+            reset_at=int(now + 2 * 24 * 3600),
+            recorded_at=_epoch_to_naive_utc(now - 30),
+        ),
+        # 8 concurrent streams add 20pp of ranking pressure, which clamps the
+        # effective percent to 100 — the raw value cannot be recovered by
+        # subtracting the pressure back out, so it must be carried.
+        runtime=RuntimeState(inflight_streams=8),
+    )
+
+    assert state.secondary_used_percent == 100.0
+    assert state.raw_secondary_used_percent == 95.0
+    assert state.secondary_window_minutes == usage_core.default_window_minutes("secondary")
+
+
+def test_state_from_account_carries_monthly_long_window_length(monkeypatch):
+    now = 1_700_000_000.0
+    monkeypatch.setattr("app.modules.proxy.load_balancer.time.time", lambda: now)
+    monkeypatch.setattr("app.core.usage.quota.time.time", lambda: now)
+
+    monthly_entry = _make_test_usage(
+        window="monthly",
+        used_percent=67.0,
+        reset_at=int(now + 9 * 24 * 3600),
+        recorded_at=_epoch_to_naive_utc(now - 30),
+    )
+    # A row that omits its duration still identifies its window.
+    monthly_entry.window_minutes = None
+
+    state = _state_from_account(
+        # A monthly-plan account: the pace line must use the monthly length, not
+        # a weekly guess derived from time-to-reset.
+        account=_make_test_account(status=AccountStatus.ACTIVE, plan_type="free"),
+        primary_entry=None,
+        secondary_entry=monthly_entry,
+        runtime=RuntimeState(),
+    )
+
+    assert state.secondary_window_minutes == usage_core.default_window_minutes("monthly")
 
 
 def test_state_from_account_carries_primary_window_minutes(monkeypatch):
@@ -6026,3 +6610,61 @@ def test_select_account_fill_first_primary_dominates_over_secondary():
     assert result.account is not None
     # Primary still wins -- only ties break on secondary.
     assert result.account.account_id == "high-secondary"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("traffic_class", "error_message", "expects_burn_window_code"),
+    [
+        ("fair_share_degraded", "No available accounts", False),
+        ("fair_share_degraded", "opportunistic burn window closed: 12% of pooled usage", True),
+        ("opportunistic", "No available accounts", True),
+    ],
+)
+async def test_burn_window_relabel_spares_codeless_fair_share_degraded_failures(
+    traffic_class: TrafficClass,
+    error_message: str,
+    expects_burn_window_code: bool,
+) -> None:
+    """A pool-wide outage must not reach degraded traffic disguised as fair-share throttling."""
+    from app.modules.proxy._load_balancer.unbound_selection import UnboundSelectionOutcome
+    from app.modules.proxy.load_balancer import OPPORTUNISTIC_BURN_WINDOW_CLOSED, LoadBalancer
+
+    mock_repos = MagicMock()
+    mock_repos.accounts.list_accounts = AsyncMock(return_value=[_make_test_account()])
+    mock_repos.usage.latest_by_account = AsyncMock(return_value={})
+    mock_repos.__aenter__ = AsyncMock(return_value=mock_repos)
+    mock_repos.__aexit__ = AsyncMock(return_value=None)
+    balancer = LoadBalancer(repo_factory=lambda: mock_repos)
+
+    async def _failing_unbound_selection(owner, *, request):
+        return UnboundSelectionOutcome(
+            selection_inputs=request.selection_inputs,
+            selected_snapshot=None,
+            selected_lease=None,
+            error_message=error_message,
+            error_code=None,
+        )
+
+    async def _select(requested_traffic_class: TrafficClass):
+        with pytest.MonkeyPatch().context() as monkeypatch:
+            monkeypatch.setattr(
+                "app.modules.proxy.load_balancer.run_unbound_selection_path",
+                _failing_unbound_selection,
+            )
+            # Keep the process-global degradation flag out of this test.
+            monkeypatch.setattr("app.modules.proxy.load_balancer.set_degraded", lambda reason=None: None)
+            monkeypatch.setattr("app.modules.proxy.load_balancer.set_normal", lambda: None)
+            return await balancer.select_account(traffic_class=requested_traffic_class)
+
+    selection = await _select(traffic_class)
+
+    if expects_burn_window_code:
+        assert selection.error_code == OPPORTUNISTIC_BURN_WINDOW_CLOSED
+    else:
+        foreground = await _select("foreground")
+        assert selection.error_code != OPPORTUNISTIC_BURN_WINDOW_CLOSED
+        assert (selection.error_code, selection.error_message) == (
+            foreground.error_code,
+            foreground.error_message,
+        )

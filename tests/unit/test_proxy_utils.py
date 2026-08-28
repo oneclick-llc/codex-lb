@@ -35,6 +35,7 @@ from websockets.frames import Close
 import app.core.clients.proxy as proxy_module
 import app.core.openai.requests as openai_requests_module
 import app.core.resilience.network_recovery as network_recovery_module
+import app.modules.proxy.fair_share_quota as fair_share_quota_module
 import app.modules.proxy.load_balancer as load_balancer_module
 from app.core import shutdown as shutdown_state
 from app.core.auth.refresh import RefreshError
@@ -65,7 +66,7 @@ from app.db.models import Account, AccountStatus, ModelSource, StickySessionKind
 from app.modules.accounts import auth_manager as auth_manager_module
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
-from app.modules.api_keys.service import ApiKeyData, ApiKeyUsageReservationData
+from app.modules.api_keys.service import TRAFFIC_CLASS_OPPORTUNISTIC, ApiKeyData, ApiKeyUsageReservationData
 from app.modules.proxy import affinity as proxy_affinity
 from app.modules.proxy import api as proxy_api
 from app.modules.proxy import request_policy as proxy_request_policy
@@ -3469,7 +3470,7 @@ async def test_opportunistic_admission_uses_api_key_enforced_model():
         enforced_model="gpt-5.2",
         enforced_reasoning_effort=None,
         enforced_service_tier=None,
-        traffic_class=proxy_api.TRAFFIC_CLASS_OPPORTUNISTIC,
+        traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
         expires_at=None,
         is_active=True,
         created_at=utcnow(),
@@ -3492,6 +3493,7 @@ async def test_opportunistic_admission_uses_api_key_enforced_model():
         api_key=api_key,
         model="gpt-5.2",
         lease_kind="stream",
+        traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
     )
 
 
@@ -3505,7 +3507,7 @@ async def test_opportunistic_admission_preserves_usage_limit_denial():
         enforced_model=None,
         enforced_reasoning_effort=None,
         enforced_service_tier=None,
-        traffic_class=proxy_api.TRAFFIC_CLASS_OPPORTUNISTIC,
+        traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
         expires_at=None,
         is_active=True,
         created_at=utcnow(),
@@ -5811,6 +5813,7 @@ def _make_proxy_settings(*, trace_channels: frozenset[str] = frozenset()) -> Sim
         proxy_account_stream_limit=8,
         proxy_account_stream_recovery_reserve=1,
         proxy_api_key_fair_share_congestion_threshold_pct=0,
+        fair_share_quota_mode_enabled=False,
         proxy_response_create_limit=64,
         proxy_compact_response_create_limit=16,
         proxy_admission_wait_timeout_seconds=10.0,
@@ -6221,7 +6224,7 @@ async def test_select_codex_control_account_without_budget_honors_traffic_class(
         enforced_model=None,
         enforced_reasoning_effort=None,
         enforced_service_tier=None,
-        traffic_class=proxy_service.TRAFFIC_CLASS_OPPORTUNISTIC,
+        traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
         expires_at=None,
         is_active=True,
         created_at=utcnow(),
@@ -6231,12 +6234,12 @@ async def test_select_codex_control_account_without_budget_honors_traffic_class(
     result = await service._select_codex_control_account_without_budget(
         affinity=proxy_service._AffinityPolicy(key=None, kind=None),
         api_key=api_key,
-        traffic_class=proxy_service.TRAFFIC_CLASS_OPPORTUNISTIC,
+        traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
     )
 
     assert result is None
     assert select_account.await_args is not None
-    assert select_account.await_args.kwargs["traffic_class"] == proxy_service.TRAFFIC_CLASS_OPPORTUNISTIC
+    assert select_account.await_args.kwargs["traffic_class"] == TRAFFIC_CLASS_OPPORTUNISTIC
 
 
 @pytest.fixture(autouse=True)
@@ -16044,6 +16047,7 @@ async def test_stream_responses_route_keyed_refresh_connect_settles_before_accou
         yield 'data: {"type":"response.completed","response":{"id":"resp_route_keyed_refresh_ok"}}\n\n'
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(fair_share_quota_module, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
     monkeypatch.setattr(proxy_service, "_STREAM_MAX_ACCOUNT_ATTEMPTS", 2)
     monkeypatch.setattr(streaming_retry_module.ProcessNetworkRecovery, "wait", AsyncMock(return_value=None))
@@ -16128,6 +16132,7 @@ async def test_stream_responses_route_failed_ordered_settlement_retries_release(
         yield 'data: {"type":"response.completed","response":{"id":"resp_route_failed_settlement"}}\n\n'
 
     monkeypatch.setattr(proxy_service, "get_settings_cache", lambda: _SettingsCache(settings))
+    monkeypatch.setattr(fair_share_quota_module, "get_settings_cache", lambda: _SettingsCache(settings))
     monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
     monkeypatch.setattr(proxy_service, "_STREAM_MAX_ACCOUNT_ATTEMPTS", 2)
     monkeypatch.setattr(proxy_service, "ApiKeysService", FakeApiKeysService)
