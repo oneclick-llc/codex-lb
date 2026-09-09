@@ -7,7 +7,6 @@ from ipaddress import ip_address
 
 from fastapi import APIRouter, HTTPException, Request
 from sqlalchemy import select as sa_select
-from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.config.settings import get_settings
@@ -59,21 +58,32 @@ async def health_ready() -> HealthCheckResponse:
     try:
         async for session in get_session():
             try:
-                await session.execute(text("SELECT 1"))
-                checks = {"database": "ok"}
-                status = "ok"
+                # One database round-trip, not two: the bridge-ring query is
+                # itself the database probe, so a separate SELECT 1 only adds
+                # an await the probe must be rescheduled for. A replica runs a
+                # single event loop, so every extra await is another turn the
+                # probe waits behind whatever the loop is already running,
+                # inside the kubelet's fixed timeout budget.
+                bridge_ring = await _get_bridge_ring_info(session)
 
                 # Upstream health (degradation flag, circuit breaker) is NOT
                 # checked here — only infrastructure readiness matters.
                 # Mixing upstream state into readiness causes permanent
                 # pod eviction after transient upstream failures.
 
-                bridge_ring = await _get_bridge_ring_info(session)
                 failure_detail = _bridge_readiness_failure_detail(bridge_ring)
+                if failure_detail is None and bridge_ring.error is not None:
+                    # The ring gate is off, so its swallowed error is the only
+                    # signal left that the database round-trip failed.
+                    failure_detail = "Service unavailable"
                 if failure_detail is not None:
                     raise HTTPException(status_code=503, detail=failure_detail)
 
-                return HealthCheckResponse(status=status, checks=checks, bridge_ring=bridge_ring)
+                return HealthCheckResponse(
+                    status="ok",
+                    checks={"database": "ok"},
+                    bridge_ring=bridge_ring,
+                )
             except HTTPException:
                 raise
             except Exception:
