@@ -652,3 +652,46 @@ async def test_internal_drain_status_rejects_non_loopback_clients():
         await internal_drain_status(cast(Any, request))
 
     assert exc_info.value.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_health_ready_fails_on_ring_query_error_when_bridge_gate_is_disabled():
+    """The ring query is the only database round-trip readiness makes.
+
+    With the bridge gate disabled its failure detail is None, so without an
+    explicit guard a database outage would be reported as ready.
+    """
+    from app.modules.health.api import health_ready
+    from app.modules.health.schemas import BridgeRingInfo
+
+    mock_session = AsyncMock()
+
+    with (
+        patch("app.core.draining._draining", False),
+        patch("app.core.startup._bridge_durable_schema_ready", True),
+        patch("app.core.startup._bridge_registration_complete", True),
+        patch("app.modules.health.api.get_session") as mock_get_session,
+        patch(
+            "app.modules.health.api.get_settings",
+            return_value=MagicMock(http_responses_session_bridge_enabled=False),
+        ),
+        patch("app.modules.health.api._get_bridge_ring_info", new=AsyncMock()) as mock_bridge_ring,
+    ):
+        mock_bridge_ring.return_value = BridgeRingInfo(
+            ring_fingerprint=None,
+            ring_size=0,
+            instance_id=None,
+            is_member=False,
+            error="unavailable: OperationalError",
+        )
+
+        async def mock_get_session_context():
+            yield mock_session
+
+        mock_get_session.return_value = mock_get_session_context()
+
+        with pytest.raises(HTTPException) as exc_info:
+            await health_ready()
+
+    assert exc_info.value.status_code == 503
+    assert exc_info.value.detail == "Service unavailable"

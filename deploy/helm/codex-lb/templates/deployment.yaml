@@ -349,6 +349,13 @@ spec:
               port: http
             initialDelaySeconds: 10
             periodSeconds: 5
+            {{- /* A replica is a single asyncio event loop (one worker per
+            replica), so a probe request is scheduled behind whatever the loop
+            is already running. Kubernetes' 1s default turns ordinary loop
+            pressure into probe failures; 5s stays under
+            failureThreshold * periodSeconds, so a wedged pod fails just as
+            fast as before. */}}
+            timeoutSeconds: 5
             failureThreshold: 3
           livenessProbe:
             httpGet:
@@ -356,4 +363,5 @@ spec:
               port: http
             initialDelaySeconds: 15
             periodSeconds: 10
+            timeoutSeconds: 5
             failureThreshold: 3
