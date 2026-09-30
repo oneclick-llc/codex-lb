@@ -882,6 +882,19 @@ export function RoutingSettings({
             </Button>
           </div>
 
+          <div className="flex items-center justify-between gap-4 p-3">
+            <div>
+              <p className="text-sm font-medium">{t("settings.routing.fairShareQuota.label")}</p>
+              <p className="text-xs text-muted-foreground">{t("settings.routing.fairShareQuota.description")}</p>
+            </div>
+            <Switch
+              aria-label={t("settings.routing.fairShareQuota.ariaLabel")}
+              checked={settings.fairShareQuotaModeEnabled}
+              disabled={busy}
+              onCheckedChange={(checked) => save({ fairShareQuotaModeEnabled: checked })}
+            />
+          </div>
+
           <div className="space-y-2 p-3">
             <div className="flex items-center justify-between gap-4">
               <div>

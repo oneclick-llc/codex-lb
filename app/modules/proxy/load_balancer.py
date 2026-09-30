@@ -941,7 +941,7 @@ class LoadBalancer:
         if selected_snapshot is None:
             owner_restricted_selection = owner_restricted_selection or selection_error_code == "hard_affinity_saturated"
             opportunistic_policy_blocked = (
-                traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC
+                traffic_class != TRAFFIC_CLASS_FOREGROUND
                 and error_message is not None
                 and error_message.startswith("opportunistic burn window closed")
             )
@@ -953,6 +953,7 @@ class LoadBalancer:
                 )
             if required_continuity_owner and selection_error_code in (None, "hard_affinity_saturated"):
                 selection_error_code = CONTINUITY_OWNER_UNAVAILABLE
+            # Static opportunistic only: relabelling degraded code-less failures reports outages as throttling.
             if traffic_class == TRAFFIC_CLASS_OPPORTUNISTIC and error_message and selection_error_code is None:
                 return AccountSelection(
                     account=None,
@@ -1380,6 +1381,7 @@ class LoadBalancer:
         lease_kind: AccountLeaseKind | None = None,
         concurrency_caps: AccountConcurrencyCaps | None = None,
         stream_reserve_slots: int = 0,
+        traffic_class: TrafficClass = TRAFFIC_CLASS_OPPORTUNISTIC,
     ) -> AccountSelection:
         selection_inputs = await self._load_selection_inputs(
             model=model,
@@ -1432,7 +1434,7 @@ class LoadBalancer:
             secondary_budget_threshold_pct=secondary_budget_threshold_pct,
             apply_secondary_budget_threshold=True,
             deterministic_probe=True,
-            traffic_class=TRAFFIC_CLASS_OPPORTUNISTIC,
+            traffic_class=traffic_class,
             ignore_standard_quota=False,
             usage_exhaustion_states=states,
         )
@@ -1444,10 +1446,12 @@ class LoadBalancer:
                     error_code=result.error_code,
                     resets_at=result.resets_at,
                 )
+            # Burn-window code only for filter verdicts; pool failures keep foreground's code.
+            closed = bool(result.error_message and result.error_message.startswith("opportunistic burn window"))
             return AccountSelection(
                 account=None,
                 error_message=result.error_message,
-                error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED,
+                error_code=OPPORTUNISTIC_BURN_WINDOW_CLOSED if closed else result.error_code,
             )
         account = account_map.get(result.account.account_id)
         if account is None:
@@ -2544,6 +2548,13 @@ def _state_from_account(
     long_window_key = "secondary"
     if effective_secondary_entry is not None and effective_secondary_entry.window == "monthly":
         long_window_key = "monthly"
+    # The pace-line gate needs the long window's actual length; a row that omits
+    # it still identifies its window, so fall back to that window's default.
+    long_window_minutes = (
+        None
+        if effective_secondary_entry is None
+        else (effective_secondary_entry.window_minutes or usage_core.default_window_minutes(long_window_key))
+    )
     capacity_credits = usage_core.capacity_for_plan(account.plan_type, long_window_key) or 0.0
     if capacity_credits > 0.0 and runtime.leased_tokens > 0:
         lease_token_weight = getattr(settings, "proxy_account_lease_token_weight", 1.0)
@@ -2564,6 +2575,8 @@ def _state_from_account(
         cooldown_until=runtime.cooldown_until,
         secondary_used_percent=effective_secondary_used_percent,
         secondary_reset_at=secondary_reset,
+        secondary_window_minutes=long_window_minutes,
+        raw_secondary_used_percent=secondary_used,
         last_error_at=runtime.last_error_at,
         last_selected_at=runtime.last_selected_at,
         error_count=runtime.error_count,

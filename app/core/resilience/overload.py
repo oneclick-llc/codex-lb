@@ -16,6 +16,12 @@ LOCAL_OVERLOAD_CODES = frozenset(
         "account_stream_cap",
         "api_key_stream_fair_share",
         "bridge_queue_full",
+        # Admission-gate denial (static opportunistic and fair-share degraded
+        # keys). A closed burn window is neither the account's fault nor a
+        # server outage: clients must see the stable 429 rate_limit_error
+        # contract (WS/first-turn selection paths previously fell through to a
+        # 503 that Codex reports as "unexpected status").
+        "opportunistic_burn_window_closed",
         "response_create_gate_timeout",
         "global_admission_timeout",
         "capacity_exhausted_active_sessions",

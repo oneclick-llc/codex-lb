@@ -86,6 +86,9 @@ export const DashboardSettingsSchema = z
     proxyAccountStreamRecoveryReserveEnvironmentValue: z.number().int().min(0).optional().default(1),
     proxyAccountStreamRecoveryReserveOverride: z.number().int().min(0).nullable().optional().default(null),
     proxyApiKeyFairShareCongestionThresholdPct: z.number().int().min(0).max(100).optional().default(0),
+    // No .default(): presence is tracked in the transform so a mixed-version
+    // rollout (GET served by an old replica) cannot silently write false back.
+    fairShareQuotaModeEnabled: z.boolean().optional(),
     proxyApiKeyFairShareCongestionThresholdPctEnvironmentValue: z
       .number()
       .int()
@@ -168,8 +171,11 @@ export const DashboardSettingsSchema = z
       settings.stickyReallocationPrimaryBudgetThresholdPct ??
       settings.stickyReallocationBudgetThresholdPct ??
       95;
+    const fairShareQuotaModeProvided = settings.fairShareQuotaModeEnabled !== undefined;
     return {
       ...settings,
+      fairShareQuotaModeEnabled: settings.fairShareQuotaModeEnabled ?? false,
+      __fairShareQuotaModeEnabledProvided: fairShareQuotaModeProvided,
       stickyReallocationBudgetThresholdPct:
         settings.stickyReallocationBudgetThresholdPct ?? primaryThreshold,
       stickyReallocationPrimaryBudgetThresholdPct: primaryThreshold,
@@ -201,6 +207,7 @@ export const SettingsUpdateRequestSchema = z
     relativeAvailabilityPower: z.number().positive().optional(),
     relativeAvailabilityTopK: z.number().int().min(1).max(20).optional(),
     singleAccountId: z.string().nullable().optional(),
+    fairShareQuotaModeEnabled: z.boolean().optional(),
     proxyAccountResponseCreateLimit: z.number().int().min(0).nullable().optional(),
     proxyAccountStreamLimit: z.number().int().min(0).nullable().optional(),
     proxyAccountStreamRecoveryReserve: z.number().int().min(0).nullable().optional(),
@@ -277,8 +284,9 @@ export const SettingsUpdateRequestSchema = z
   });
 
 type ParsedDashboardSettings = z.infer<typeof DashboardSettingsSchema>;
-type StickyThresholdPresenceFlags = Pick<
+type PresenceFlags = Pick<
   ParsedDashboardSettings,
+  | "__fairShareQuotaModeEnabledProvided"
   | "__stickyReallocationBudgetThresholdPctProvided"
   | "__stickyReallocationPrimaryBudgetThresholdPctProvided"
   | "__stickyReallocationSecondaryBudgetThresholdPctProvided"
@@ -292,9 +300,9 @@ type StickyThresholdValues = Pick<
 
 export type DashboardSettings = Omit<
   ParsedDashboardSettings,
-  keyof StickyThresholdPresenceFlags | keyof StickyThresholdValues
+  keyof PresenceFlags | keyof StickyThresholdValues
 > &
-  Partial<StickyThresholdPresenceFlags> &
+  Partial<PresenceFlags> &
   Partial<StickyThresholdValues>;
 export type SettingsUpdateRequest = z.infer<typeof SettingsUpdateRequestSchema>;
 export type AdditionalQuotaRoutingPolicy = z.infer<typeof AdditionalQuotaRoutingPolicySchema>;

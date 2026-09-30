@@ -523,6 +523,7 @@ export function createDashboardSettings(
 		proxyAccountStreamRecoveryReserveEnvironmentValue: 1,
 		proxyAccountStreamRecoveryReserveOverride: 1,
 		proxyApiKeyFairShareCongestionThresholdPct: 0,
+		fairShareQuotaModeEnabled: false,
 		proxyApiKeyFairShareCongestionThresholdPctEnvironmentValue: 0,
 		proxyApiKeyFairShareCongestionThresholdPctOverride: 0,
 		weeklyPaceWorkingDays: "0,1,2,3,4,5,6",

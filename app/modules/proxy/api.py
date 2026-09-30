@@ -44,6 +44,7 @@ from app.core.auth.dependencies import (
     validate_usage_api_key,
 )
 from app.core.auth.refresh import RefreshError
+from app.core.balancer import TRAFFIC_CLASS_FAIR_SHARE_DEGRADED
 from app.core.cache.invalidation import NAMESPACE_RESET_CREDITS, bump_cache_invalidation_local
 from app.core.clients.files import FileProxyError
 from app.core.clients.proxy import (
@@ -166,7 +167,7 @@ from app.modules.accounts.auth_manager import AuthManager
 from app.modules.accounts.repository import AccountsRepository
 from app.modules.api_keys.repository import ApiKeysRepository
 from app.modules.api_keys.service import (
-    TRAFFIC_CLASS_OPPORTUNISTIC,
+    TRAFFIC_CLASS_FOREGROUND,
     ApiKeyData,
     ApiKeyInvalidError,
     ApiKeyRateLimitExceededError,
@@ -236,6 +237,7 @@ from app.modules.proxy._service.support import (
 )
 from app.modules.proxy.account_cache import get_account_selection_cache
 from app.modules.proxy.api_key_usage import estimate_api_key_request_usage
+from app.modules.proxy.fair_share_quota import fair_share_denial_detail
 from app.modules.proxy.helpers import _rate_limit_details
 from app.modules.proxy.http_bridge_forwarding import parse_forwarded_request
 from app.modules.proxy.images_observability import (
@@ -244,6 +246,7 @@ from app.modules.proxy.images_observability import (
     IMAGE_ROUTE_STREAM_STATE,
     record_images_route_observability,
 )
+from app.modules.proxy.load_balancer import OPPORTUNISTIC_BURN_WINDOW_CLOSED
 from app.modules.proxy.request_policy import (
     apply_api_key_enforcement,
     apply_api_key_enforcement_to_chat_payload,
@@ -264,6 +267,7 @@ from app.modules.proxy.request_policy import (
     validate_model_access,
     validate_top_level_compaction_trigger_input_shape,
 )
+from app.modules.proxy.request_traffic_class import resolve_request_traffic_class
 from app.modules.proxy.schemas import (
     AccountPoolUsageResponse,
     CodexModelEntry,
@@ -8016,14 +8020,25 @@ async def _opportunistic_admission_denial(
     model: str | None,
     lease_kind: Literal["response_create", "stream"] | None = "stream",
 ) -> JSONResponse | None:
-    if api_key is None or api_key.traffic_class != TRAFFIC_CLASS_OPPORTUNISTIC:
+    if api_key is None:
+        return None
+    # Pins the class for the rest of the request: the selection that actually
+    # runs later must not be re-resolved against a newer classifier snapshot.
+    traffic_class = await resolve_request_traffic_class(api_key)
+    if traffic_class == TRAFFIC_CLASS_FOREGROUND:
         return None
     selection = await context.service.check_opportunistic_admission(
         api_key=api_key,
         model=_effective_optional_model_for_api_key(api_key, model),
         lease_kind=lease_kind,
+        traffic_class=traffic_class,
     )
     if selection.account is not None:
+        return None
+    if selection.error_code not in (USAGE_LIMIT_REACHED, OPPORTUNISTIC_BURN_WINDOW_CLOSED):
+        # Not a gate verdict (empty pool, backoff, paused accounts): let the
+        # request proceed to normal selection, which fails with the same
+        # pool-level error foreground traffic gets.
         return None
     if selection.error_code == USAGE_LIMIT_REACHED:
         return _logged_error_json_response(
@@ -8039,6 +8054,10 @@ async def _opportunistic_admission_denial(
     message = selection.error_message or "opportunistic burn window closed"
     if not message.startswith("opportunistic burn window closed"):
         message = f"opportunistic burn window closed: {message}"
+    if traffic_class == TRAFFIC_CLASS_FAIR_SHARE_DEGRADED:
+        detail = fair_share_denial_detail(api_key.id)
+        if detail is not None:
+            message = f"{message}; your key's share of pooled usage: {detail}"
     return _logged_error_json_response(
         request,
         429,

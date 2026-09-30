@@ -212,6 +212,60 @@ async def sum_demand_window(
     return folded_total, raw_windows
 
 
+async def sum_hourly_cost_by_api_key_window(
+    session: AsyncSession,
+    since: datetime,
+    until: datetime | None = None,
+    *,
+    filters: Sequence[ColumnElement[bool]] = (),
+) -> tuple[dict[str, float], list[RawWindow]]:
+    """Watermark-consistent SUM(cost_usd) GROUP BY api_key_id over the hourly rollup.
+
+    Same partitioning rule as the row readers, aggregated in SQL so a long
+    window never materializes every hour x dimension rollup row. Returned keys
+    stay in the encoded dimension domain (``to_dimension``). The watermark and
+    the folded sums come from ONE statement (state LEFT JOIN rollup, with the
+    bucket upper bound expressed against the state row's own watermark epoch),
+    so a concurrently committing fold or escape-hatch reset can never pair an
+    old watermark with already-truncated rollups. With no watermark the sums
+    are empty and the raw windows cover the full range.
+    """
+    lo_epoch = epoch_seconds(ceil_to_grid(since, HOURLY_BUCKET_SECONDS))
+    if session.get_bind().dialect.name == "postgresql":
+        watermark_epoch = sa_cast(func.extract("epoch", AccountUsageRollupState.hourly_folded_through), BigInteger)
+    else:
+        watermark_epoch = sa_cast(func.strftime("%s", AccountUsageRollupState.hourly_folded_through), Integer)
+    join_conditions = [
+        *filters,
+        RequestUsageHourlyRollup.bucket_epoch >= lo_epoch,
+        RequestUsageHourlyRollup.bucket_epoch < watermark_epoch,
+    ]
+    if until is not None:
+        join_conditions.append(
+            RequestUsageHourlyRollup.bucket_epoch < epoch_seconds(floor_to_grid(until, HOURLY_BUCKET_SECONDS))
+        )
+    stmt = (
+        select(
+            AccountUsageRollupState.hourly_folded_through,
+            RequestUsageHourlyRollup.api_key_id,
+            func.coalesce(func.sum(RequestUsageHourlyRollup.cost_usd), 0.0),
+        )
+        .select_from(AccountUsageRollupState)
+        .outerjoin(RequestUsageHourlyRollup, and_(*join_conditions))
+        .where(AccountUsageRollupState.id == _STATE_ROW_ID)
+        .group_by(AccountUsageRollupState.hourly_folded_through, RequestUsageHourlyRollup.api_key_id)
+    )
+    rows = (await session.execute(stmt)).all()
+    if not rows:
+        return {}, [(since, until)]
+    watermark = rows[0][0]
+    folded_until_epoch, raw_windows = _partition_raw_windows(since, until, watermark, HOURLY_BUCKET_SECONDS)
+    if folded_until_epoch is None:
+        return {}, raw_windows
+    costs = {str(key): float(total or 0.0) for _, key, total in rows if key is not None}
+    return costs, raw_windows
+
+
 def raw_windows_clause(windows: Sequence[RawWindow]) -> ColumnElement[bool]:
     """OR of half-open requested_at windows; callers skip raw entirely when
     ``windows`` is empty instead of emitting a degenerate clause."""

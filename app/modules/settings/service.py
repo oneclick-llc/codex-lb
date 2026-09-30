@@ -24,6 +24,7 @@ class DashboardSettingsData:
     proxy_account_stream_recovery_reserve: int
     proxy_account_stream_recovery_reserve_override: int | None
     proxy_api_key_fair_share_congestion_threshold_pct: int
+    fair_share_quota_mode_enabled: bool
     proxy_api_key_fair_share_congestion_threshold_pct_override: int | None
     upstream_proxy_routing_enabled: bool
     upstream_proxy_default_pool_id: str | None
@@ -83,6 +84,7 @@ class DashboardSettingsUpdateData:
     proxy_account_stream_recovery_reserve: int | None
     clear_proxy_account_stream_recovery_reserve: bool
     proxy_api_key_fair_share_congestion_threshold_pct: int | None
+    fair_share_quota_mode_enabled: bool
     clear_proxy_api_key_fair_share_congestion_threshold_pct: bool
     upstream_proxy_routing_enabled: bool
     upstream_proxy_default_pool_id: str | None
@@ -152,6 +154,7 @@ class SettingsService:
             proxy_api_key_fair_share_congestion_threshold_pct=_effective_api_key_fair_share_threshold_pct(
                 row.proxy_api_key_fair_share_congestion_threshold_pct
             ),
+            fair_share_quota_mode_enabled=row.fair_share_quota_mode_enabled,
             proxy_api_key_fair_share_congestion_threshold_pct_override=(
                 row.proxy_api_key_fair_share_congestion_threshold_pct
             ),
@@ -228,6 +231,7 @@ class SettingsService:
             proxy_api_key_fair_share_congestion_threshold_pct=(
                 payload.proxy_api_key_fair_share_congestion_threshold_pct
             ),
+            fair_share_quota_mode_enabled=payload.fair_share_quota_mode_enabled,
             clear_proxy_api_key_fair_share_congestion_threshold_pct=(
                 payload.clear_proxy_api_key_fair_share_congestion_threshold_pct
             ),
@@ -294,6 +298,7 @@ class SettingsService:
             proxy_api_key_fair_share_congestion_threshold_pct=_effective_api_key_fair_share_threshold_pct(
                 row.proxy_api_key_fair_share_congestion_threshold_pct
             ),
+            fair_share_quota_mode_enabled=row.fair_share_quota_mode_enabled,
             proxy_api_key_fair_share_congestion_threshold_pct_override=(
                 row.proxy_api_key_fair_share_congestion_threshold_pct
             ),

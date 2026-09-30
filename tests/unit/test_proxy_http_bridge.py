@@ -9145,7 +9145,11 @@ async def test_select_account_with_budget_prefers_durable_account_id_when_availa
         proxy_service,
         "get_settings_cache",
         lambda: SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(sticky_reallocation_budget_threshold_pct=95.0))
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    sticky_reallocation_budget_threshold_pct=95.0, fair_share_quota_mode_enabled=False
+                )
+            )
         ),
     )
 
@@ -9183,7 +9187,11 @@ async def test_select_account_with_budget_skips_preferred_account_outside_assign
         proxy_service,
         "get_settings_cache",
         lambda: SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(sticky_reallocation_budget_threshold_pct=95.0))
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    sticky_reallocation_budget_threshold_pct=95.0, fair_share_quota_mode_enabled=False
+                )
+            )
         ),
     )
 
@@ -9221,7 +9229,11 @@ async def test_select_account_with_budget_classifies_continuity_owner_outside_as
         proxy_service,
         "get_settings_cache",
         lambda: SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(sticky_reallocation_budget_threshold_pct=95.0))
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    sticky_reallocation_budget_threshold_pct=95.0, fair_share_quota_mode_enabled=False
+                )
+            )
         ),
     )
 
@@ -10953,7 +10965,11 @@ async def test_select_account_with_budget_required_file_pin_does_not_fallback_on
         proxy_service,
         "get_settings_cache",
         lambda: SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(sticky_reallocation_budget_threshold_pct=95.0))
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    sticky_reallocation_budget_threshold_pct=95.0, fair_share_quota_mode_enabled=False
+                )
+            )
         ),
     )
 
@@ -11092,7 +11108,11 @@ async def test_select_account_with_budget_required_preferred_does_not_fallback_w
         proxy_service,
         "get_settings_cache",
         lambda: SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(sticky_reallocation_budget_threshold_pct=95.0))
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    sticky_reallocation_budget_threshold_pct=95.0, fair_share_quota_mode_enabled=False
+                )
+            )
         ),
     )
 
@@ -11135,7 +11155,11 @@ async def test_select_account_with_budget_soft_preference_can_fallback_after_acc
         proxy_service,
         "get_settings_cache",
         lambda: SimpleNamespace(
-            get=AsyncMock(return_value=SimpleNamespace(sticky_reallocation_budget_threshold_pct=95.0))
+            get=AsyncMock(
+                return_value=SimpleNamespace(
+                    sticky_reallocation_budget_threshold_pct=95.0, fair_share_quota_mode_enabled=False
+                )
+            )
         ),
     )
 

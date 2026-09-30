@@ -278,6 +278,21 @@ if PROMETHEUS_AVAILABLE:
         registry=REGISTRY,
         **_gauge_kwargs,
     )
+    fair_share_quota_degradations_total = Counter(
+        "codex_lb_fair_share_quota_degradations_total",
+        "Total admissions where fair-share quota mode degraded a foreground API key to "
+        "fair_share_degraded admission (a request resolves its traffic class once, so this counts "
+        "admissions, not resolutions)",
+        registry=REGISTRY,
+    )
+    # Sibling workers classify from the same rollups on independent cache
+    # timers; livemax reports the freshest non-stale worker view.
+    fair_share_quota_over_share_keys = Gauge(
+        "codex_lb_fair_share_quota_over_share_keys",
+        "API keys currently classified over their fair quota share",
+        registry=REGISTRY,
+        **_replica_gauge_kwargs,
+    )
     proxy_phase_latency_seconds = Histogram(
         "codex_lb_proxy_phase_latency_seconds",
         "Proxy phase latency by low-cardinality phase and transport labels",
@@ -389,6 +404,8 @@ else:
     account_inflight_leases: GaugeLike | None = None
     account_cap_rejections_total: CounterLike | None = None
     api_key_fair_share_rejections_total: CounterLike | None = None
+    fair_share_quota_degradations_total: CounterLike | None = None
+    fair_share_quota_over_share_keys: GaugeLike | None = None
     stream_pool_capacity: GaugeLike | None = None
     stream_pool_inflight: GaugeLike | None = None
     cap_partition_replicas: GaugeLike | None = None
@@ -444,6 +461,8 @@ __all__ = [
     "continuity_fail_closed_total",
     "event_loop_lag_seconds",
     "event_loop_lag_warnings_total",
+    "fair_share_quota_degradations_total",
+    "fair_share_quota_over_share_keys",
     "continuity_owner_resolution_total",
     "http_bridge_prewarm_total",
     "http_bridge_retry_circuit_total",

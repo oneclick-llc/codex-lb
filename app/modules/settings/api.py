@@ -155,6 +155,7 @@ def _dashboard_settings_response(settings) -> DashboardSettingsResponse:
         ),
         proxy_account_stream_recovery_reserve_override=(settings.proxy_account_stream_recovery_reserve_override),
         proxy_api_key_fair_share_congestion_threshold_pct=(settings.proxy_api_key_fair_share_congestion_threshold_pct),
+        fair_share_quota_mode_enabled=settings.fair_share_quota_mode_enabled,
         proxy_api_key_fair_share_congestion_threshold_pct_environment_value=(
             getattr(
                 environment_settings,
@@ -723,6 +724,11 @@ async def update_settings(
                     if "proxy_api_key_fair_share_congestion_threshold_pct" in payload.model_fields_set
                     else None
                 ),
+                fair_share_quota_mode_enabled=(
+                    payload.fair_share_quota_mode_enabled
+                    if payload.fair_share_quota_mode_enabled is not None
+                    else current.fair_share_quota_mode_enabled
+                ),
                 clear_proxy_api_key_fair_share_congestion_threshold_pct=(
                     "proxy_api_key_fair_share_congestion_threshold_pct" in payload.model_fields_set
                     and payload.proxy_api_key_fair_share_congestion_threshold_pct is None
@@ -920,6 +926,7 @@ async def update_settings(
             "proxy_account_stream_limit",
             "proxy_account_stream_recovery_reserve",
             "proxy_api_key_fair_share_congestion_threshold_pct",
+            "fair_share_quota_mode_enabled",
             "upstream_proxy_routing_enabled",
             "upstream_proxy_default_pool_id",
             "prefer_earlier_reset_accounts",
