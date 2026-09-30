@@ -76,6 +76,12 @@ def test_get_pricing_for_model_gpt_5_4_alias():
         ("gpt-5.6-luna-2026-07-13", "gpt-5.6-luna"),
         ("gpt-6-astra", "gpt-6-astra"),
         ("gpt-6-astra-2026-09-10", "gpt-6-astra"),
+        ("gpt-6-sol", "gpt-6-sol"),
+        ("gpt-6-sol-2026-09-20", "gpt-6-sol"),
+        ("gpt-6-luna", "gpt-6-luna"),
+        ("gpt-6-luna-2026-09-20", "gpt-6-luna"),
+        ("gpt-6.1-sol", "gpt-6.1-sol"),
+        ("gpt-6.1-sol-2026-09-30", "gpt-6.1-sol"),
     ],
 )
 def test_get_pricing_for_model_gpt_5_6_aliases(requested_model: str, canonical_model: str) -> None:
@@ -248,6 +254,15 @@ def test_calculate_cost_from_usage_flex_service_tier():
         ("gpt-6-astra", "flex", 25.55),
         ("gpt-6-astra", "priority", 102.2),
         ("gpt-6-astra", "fast", 102.2),
+        ("gpt-6-sol", None, 10.22),
+        ("gpt-6-sol", "flex", 5.11),
+        ("gpt-6-sol", "priority", 20.44),
+        ("gpt-6-luna", None, 0.511),
+        ("gpt-6-luna", "flex", 0.2555),
+        ("gpt-6-luna", "priority", 1.022),
+        ("gpt-6.1-sol", None, 10.21),
+        ("gpt-6.1-sol", "flex", 5.105),
+        ("gpt-6.1-sol", "priority", 20.42),
     ],
 )
 def test_calculate_cost_from_usage_gpt_5_6_service_tiers(
@@ -277,6 +292,12 @@ def test_calculate_cost_from_usage_gpt_5_6_service_tiers(
         ("gpt-5.6-luna", "flex", 0.141),
         ("gpt-6-astra", None, 12.6),
         ("gpt-6-astra", "flex", 6.3),
+        ("gpt-6-sol", None, 2.52),
+        ("gpt-6-sol", "flex", 1.26),
+        ("gpt-6-luna", None, 0.126),
+        ("gpt-6-luna", "flex", 0.063),
+        ("gpt-6.1-sol", None, 2.51),
+        ("gpt-6.1-sol", "flex", 1.255),
     ],
 )
 def test_calculate_cost_from_usage_gpt_5_6_long_context(
@@ -302,6 +323,9 @@ def test_calculate_cost_from_usage_gpt_5_6_long_context(
         ("gpt-5.6-terra", 2.0, 4.0),
         ("gpt-5.6-luna", 0.2, 0.4),
         ("gpt-6-astra", 10.0, 20.0),
+        ("gpt-6-sol", 2.0, 4.0),
+        ("gpt-6-luna", 0.1, 0.2),
+        ("gpt-6.1-sol", 2.0, 4.0),
     ],
 )
 def test_calculate_cost_from_usage_gpt_5_6_uses_272k_long_context_boundary(
