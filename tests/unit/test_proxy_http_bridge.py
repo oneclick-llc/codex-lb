@@ -20834,6 +20834,340 @@ async def test_process_http_bridge_upstream_text_masks_single_previous_response_
     assert session.queued_request_count == 0
 
 
+async def _half_open_probe_on_dead_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    key_value: str,
+    proxy_injected: bool = True,
+    full_resend: bool = True,
+) -> tuple[
+    proxy_service.ProxyService,
+    proxy_service._HTTPBridgeSession,
+    DurableBridgeSessionCoordinator,
+    str,
+]:
+    """A half-open retry-circuit probe whose anchor upstream no longer knows."""
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    coordinator = DurableBridgeSessionCoordinator(
+        cast(Callable[[], AsyncSession], async_sessionmaker(engine, expire_on_commit=False))
+    )
+    settings = _make_app_settings()
+    monkeypatch.setattr(proxy_service, "get_settings", lambda: settings)
+    instance_id = settings.http_responses_session_bridge_instance_id
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value=key_value,
+        api_key_id=None,
+        instance_id=instance_id,
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-bridge",
+        model="gpt-5.2",
+        service_tier=None,
+        latest_turn_state="ts-1",
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    await coordinator.register_turn_state(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id=instance_id,
+        owner_epoch=claimed.owner_epoch,
+        turn_state="ts-1",
+        lease_ttl_seconds=60.0,
+    )
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id=None,
+        instance_id=instance_id,
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp_dead",
+        lease_ttl_seconds=60.0,
+    )
+
+    service = proxy_service.ProxyService(cast(Any, nullcontext()))
+    service._durable_bridge = coordinator
+    monkeypatch.setattr(service, "_handle_stream_error", AsyncMock())
+    request_state = proxy_service._WebSocketRequestState(
+        request_id=f"req-{key_value}",
+        model="gpt-5.2",
+        service_tier=None,
+        reasoning_effort=None,
+        api_key_reservation=None,
+        started_at=1.0,
+        previous_response_id="resp_dead",
+        event_queue=asyncio.Queue(),
+        transport="http",
+        skip_request_log=True,
+    )
+    request_state.proxy_injected_previous_response_id = proxy_injected
+    request_state.proxy_injected_anchor_had_full_resend_payload = full_resend
+    session = _make_bridge_session(key_value=key_value, pending_requests=deque([request_state]), queued_request_count=1)
+    session.durable_session_id = claimed.session_id
+    session.durable_owner_epoch = claimed.owner_epoch
+    session.last_completed_response_id = "resp_dead"
+    # Two eventless strikes opened the circuit; this request is the half-open probe.
+    now = time.monotonic()
+    cast(Any, service)._http_bridge_retry_circuits[session.key] = (
+        http_bridge_retry_circuit_module._HTTPBridgeRetryCircuitState(
+            consecutive_failures=2,
+            cooldown_until=0.0,
+            half_open_until=now + 600.0,
+            last_detail="stream_incomplete",
+            last_touched_monotonic=now,
+            last_failure_monotonic=now,
+        )
+    )
+    return service, session, coordinator, claimed.session_id
+
+
+async def _reject_dead_anchor(service: proxy_service.ProxyService, session: proxy_service._HTTPBridgeSession) -> None:
+    await service._process_http_bridge_upstream_text(
+        session,
+        json.dumps(
+            {
+                "type": "error",
+                "status": 400,
+                "error": {
+                    "type": "invalid_request_error",
+                    "code": "previous_response_not_found",
+                    "message": "Previous response with id 'resp_dead' not found.",
+                    "param": "previous_response_id",
+                },
+            },
+            separators=(",", ":"),
+        ),
+    )
+
+
+@pytest.mark.asyncio
+async def test_rejected_proxy_injected_anchor_is_dropped_and_the_retry_circuit_closes(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, session, coordinator, session_id = await _half_open_probe_on_dead_anchor(
+        monkeypatch, key_value="sid-dead-anchor"
+    )
+    assert await service._http_bridge_precreated_retry_allowed(session) is False
+    caplog.set_level(logging.INFO)
+
+    await _reject_dead_anchor(service, session)
+
+    # The next request is admitted at once instead of waiting out the 600 s half-open lease.
+    assert await service._http_bridge_precreated_retry_allowed(session) is True
+    durable = (await coordinator.lookup_sessions(session_ids=[session_id]))[0]
+    assert durable.latest_response_id is None
+    assert durable.latest_turn_state == "ts-1"
+    assert session.last_completed_response_id is None
+    assert "event=durable_anchor_invalidated" in caplog.text
+    assert "http_bridge_retry_circuit event=reset" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rejected_anchor_clear_keeps_a_response_anchor_written_meanwhile(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    service, session, coordinator, session_id = await _half_open_probe_on_dead_anchor(
+        monkeypatch, key_value="sid-dead-anchor-race-response"
+    )
+    persist = coordinator.persist_retry_circuit
+
+    async def persist_then_complete(**kwargs: Any) -> Any:
+        result = await persist(**kwargs)
+        # A concurrent turn completes between the strike and the anchor clear.
+        await coordinator.register_previous_response_id(
+            session_id=session_id,
+            api_key_id=None,
+            instance_id=_make_app_settings().http_responses_session_bridge_instance_id,
+            owner_epoch=cast(int, session.durable_owner_epoch),
+            response_id="resp_fresh",
+            lease_ttl_seconds=60.0,
+        )
+        session.last_completed_response_id = "resp_fresh"
+        return result
+
+    monkeypatch.setattr(coordinator, "persist_retry_circuit", persist_then_complete)
+    caplog.set_level(logging.INFO)
+
+    await _reject_dead_anchor(service, session)
+
+    durable = (await coordinator.lookup_sessions(session_ids=[session_id]))[0]
+    assert durable.latest_response_id == "resp_fresh"
+    assert durable.latest_turn_state == "ts-1"
+    assert session.last_completed_response_id == "resp_fresh"
+    assert "event=durable_anchor_invalidated" not in caplog.text
+    # The strike stands: no confirmed clear, so the circuit is not reset by this path.
+    assert await service._http_bridge_precreated_retry_cooldown_seconds(session) > 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_anchor_clear_keeps_continuity_when_only_the_turn_state_moved(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, session, coordinator, session_id = await _half_open_probe_on_dead_anchor(
+        monkeypatch, key_value="sid-dead-anchor-race-turn"
+    )
+    persist = coordinator.persist_retry_circuit
+
+    async def persist_then_new_turn_state(**kwargs: Any) -> Any:
+        result = await persist(**kwargs)
+        await coordinator.register_turn_state(
+            session_id=session_id,
+            api_key_id=None,
+            instance_id=_make_app_settings().http_responses_session_bridge_instance_id,
+            owner_epoch=cast(int, session.durable_owner_epoch),
+            turn_state="ts-2",
+            lease_ttl_seconds=60.0,
+        )
+        return result
+
+    monkeypatch.setattr(coordinator, "persist_retry_circuit", persist_then_new_turn_state)
+
+    await _reject_dead_anchor(service, session)
+
+    durable = (await coordinator.lookup_sessions(session_ids=[session_id]))[0]
+    assert durable.latest_response_id == "resp_dead"
+    assert durable.latest_turn_state == "ts-2"
+    for turn_state in ("ts-1", "ts-2"):
+        lookup = await coordinator.lookup_request_targets(
+            session_key_kind="session_header",
+            session_key_value="sid-dead-anchor-race-turn",
+            api_key_id=None,
+            turn_state=turn_state,
+            session_header=None,
+            previous_response_id=None,
+        )
+        assert lookup is not None
+        assert lookup.session_id == session_id
+    # The live copy stays in step with the row, so this session does not send the next turn without context.
+    assert session.last_completed_response_id == "resp_dead"
+    # The half-open lease is released by the strike: an honest cooldown replaces the 600 s wedge.
+    assert await service._http_bridge_precreated_retry_cooldown_seconds(session) > 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_anchor_keeps_both_copies_when_the_durable_read_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, session, coordinator, session_id = await _half_open_probe_on_dead_anchor(
+        monkeypatch, key_value="sid-dead-anchor-read-fails"
+    )
+    lookup_sessions = coordinator.lookup_sessions
+    monkeypatch.setattr(coordinator, "lookup_sessions", AsyncMock(side_effect=RuntimeError("durable read failed")))
+
+    await _reject_dead_anchor(service, session)
+
+    durable = (await lookup_sessions(session_ids=[session_id]))[0]
+    assert durable.latest_response_id == "resp_dead"
+    assert session.last_completed_response_id == "resp_dead"
+    assert await service._http_bridge_precreated_retry_cooldown_seconds(session) > 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_anchor_settles_when_the_reader_is_cancelled_mid_settle(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, session, coordinator, session_id = await _half_open_probe_on_dead_anchor(
+        monkeypatch, key_value="sid-dead-anchor-cancelled"
+    )
+    lookup_sessions = coordinator.lookup_sessions
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def blocking_lookup(**kwargs: Any) -> Any:
+        entered.set()
+        await release.wait()
+        return await lookup_sessions(**kwargs)
+
+    monkeypatch.setattr(coordinator, "lookup_sessions", blocking_lookup)
+    reader = asyncio.create_task(_reject_dead_anchor(service, session))
+    await asyncio.wait_for(entered.wait(), 1.0)
+    reader.cancel()
+    await asyncio.sleep(0)
+    release.set()
+    with pytest.raises(asyncio.CancelledError):
+        await reader
+
+    durable = (await lookup_sessions(session_ids=[session_id]))[0]
+    assert durable.latest_response_id is None
+    assert session.last_completed_response_id is None
+    assert await service._http_bridge_precreated_retry_allowed(session) is True
+
+
+@pytest.mark.asyncio
+async def test_rejected_anchor_with_a_held_safe_replay_is_left_to_the_replay(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, session, _coordinator, _session_id = await _half_open_probe_on_dead_anchor(
+        monkeypatch, key_value="sid-dead-anchor-safe-replay"
+    )
+    request_state = session.pending_requests[0]
+    request_state.fresh_upstream_request_is_retry_safe = True
+    request_state.fresh_upstream_request_text = '{"type":"response.create"}'
+    settle = AsyncMock()
+    monkeypatch.setattr(http_bridge_upstream_events_module, "_settle_rejected_http_bridge_anchor", settle)
+
+    await _reject_dead_anchor(service, session)
+
+    settle.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_rejected_delta_only_anchor_records_a_strike_but_keeps_the_anchor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, session, coordinator, session_id = await _half_open_probe_on_dead_anchor(
+        monkeypatch, key_value="sid-dead-anchor-delta", full_resend=False
+    )
+
+    await _reject_dead_anchor(service, session)
+
+    durable = (await coordinator.lookup_sessions(session_ids=[session_id]))[0]
+    assert durable.latest_response_id == "resp_dead"
+    assert session.last_completed_response_id == "resp_dead"
+    assert await service._http_bridge_precreated_retry_cooldown_seconds(session) > 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_delta_only_anchors_open_a_closed_circuit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, session, _coordinator, _session_id = await _half_open_probe_on_dead_anchor(
+        monkeypatch, key_value="sid-dead-anchor-delta-closed", full_resend=False
+    )
+    cast(Any, service)._http_bridge_retry_circuits.pop(session.key)
+    request_state = session.pending_requests[0]
+
+    # Intended: a delta-only request cannot drop the anchor, so every retry
+    # would inject it again and fail. Two rejections open the circuit and
+    # later requests wait out a cooldown instead.
+    for _ in range(2):
+        await http_bridge_upstream_events_module._settle_rejected_http_bridge_anchor(service, session, request_state)
+
+    assert await service._http_bridge_precreated_retry_allowed(session) is False
+    assert await service._http_bridge_precreated_retry_cooldown_seconds(session) > 0
+
+
+@pytest.mark.asyncio
+async def test_rejected_client_supplied_anchor_leaves_circuit_and_anchor_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    service, session, coordinator, session_id = await _half_open_probe_on_dead_anchor(
+        monkeypatch, key_value="sid-dead-anchor-client", proxy_injected=False
+    )
+
+    await _reject_dead_anchor(service, session)
+
+    durable = (await coordinator.lookup_sessions(session_ids=[session_id]))[0]
+    assert durable.latest_response_id == "resp_dead"
+    state = cast(Any, service)._http_bridge_retry_circuits[session.key]
+    assert state.consecutive_failures == 2
+    assert state.half_open_until > time.monotonic()
+
+
 @pytest.mark.asyncio
 async def test_process_http_bridge_upstream_text_masks_previous_response_not_found_when_anchor_was_lost(
     monkeypatch: pytest.MonkeyPatch,
