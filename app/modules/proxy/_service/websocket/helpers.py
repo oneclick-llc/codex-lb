@@ -5,7 +5,7 @@ import json
 import sys
 import time
 from collections import deque
-from collections.abc import Awaitable, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any, cast
 
@@ -55,6 +55,9 @@ from app.core.openai.requests import (
     extract_input_file_ids,
 )
 from app.core.types import JsonValue
+from app.core.utils.shared_future import (
+    _await_cleanup_deferring_cancellation as _await_cleanup_deferring_cancellation,
+)
 from app.core.utils.sse import CODEX_KEEPALIVE_FRAME as CODEX_KEEPALIVE_FRAME  # noqa: F401
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.core.utils.time import to_utc_naive, utcnow
@@ -1752,23 +1755,6 @@ async def _release_websocket_response_create_gate(
     response_create_gate.release()
     if cancellation is not None:
         raise cancellation
-
-
-async def _await_cleanup_deferring_cancellation(awaitable: Awaitable[object]) -> asyncio.CancelledError | None:
-    """Finish response-create lease cleanup before propagating cancellation."""
-
-    task = asyncio.ensure_future(awaitable)
-    cancellation: asyncio.CancelledError | None = None
-    with anyio.CancelScope(shield=True):
-        while True:
-            try:
-                await asyncio.shield(task)
-                break
-            except asyncio.CancelledError as exc:
-                cancellation = cancellation or exc
-                if task.cancelled():
-                    raise
-    return cancellation
 
 
 def _pop_terminal_websocket_request_state(

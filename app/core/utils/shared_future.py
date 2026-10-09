@@ -20,6 +20,7 @@ touch the shared future's callback list.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Awaitable
 from typing import TypeVar, cast
 
 import anyio
@@ -132,3 +133,20 @@ async def _await_task_deferring_cancellation(
         except asyncio.CancelledError as exc:
             cancellation = exc
     return cast(_TaskResultT, result), cancellation
+
+
+async def _await_result_deferring_cancellation(
+    awaitable: "Awaitable[_TaskResultT]",
+) -> tuple[_TaskResultT, asyncio.CancelledError | None]:
+    """``_await_task_deferring_cancellation`` for a bare awaitable."""
+
+    return await _await_task_deferring_cancellation(asyncio.ensure_future(awaitable))
+
+
+async def _await_cleanup_deferring_cancellation(
+    awaitable: "Awaitable[object]",
+) -> asyncio.CancelledError | None:
+    """Finish required cleanup, returning the deferred cancellation marker."""
+
+    _, cancellation = await _await_result_deferring_cancellation(awaitable)
+    return cancellation

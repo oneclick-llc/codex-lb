@@ -154,6 +154,12 @@ from app.core.upstream_proxy import ResolvedUpstreamRoute, UpstreamProxyRouteErr
 from app.core.utils.json_guards import is_json_list, is_json_mapping
 from app.core.utils.request_id import ensure_request_id, get_request_id
 from app.core.utils.shared_future import (
+    _await_cleanup_deferring_cancellation as _shared_await_cleanup_deferring_cancellation,
+)
+from app.core.utils.shared_future import (
+    _await_result_deferring_cancellation as _shared_await_result_deferring_cancellation,
+)
+from app.core.utils.shared_future import (
     _await_task_deferring_cancellation as _shared_await_task_deferring_cancellation,
 )
 from app.core.utils.shared_future import wait_on_shared_future
@@ -2159,23 +2165,14 @@ async def _release_reservation_deferring_cancellation(
 async def _await_result_deferring_cancellation(awaitable: Awaitable[_T]) -> tuple[_T, bool]:
     """Finish an owned awaitable despite repeated cancellation and report whether cancellation arrived."""
 
-    task = asyncio.ensure_future(awaitable)
-    cancellation_deferred = False
-    with anyio.CancelScope(shield=True):
-        while True:
-            try:
-                return await asyncio.shield(task), cancellation_deferred
-            except asyncio.CancelledError:
-                if task.cancelled():
-                    raise
-                cancellation_deferred = True
-    raise RuntimeError("unreachable shielded cancellation-deferral state")
+    result, cancellation = await _shared_await_result_deferring_cancellation(awaitable)
+    return result, cancellation is not None
 
 
 async def _await_cleanup_deferring_cancellation(awaitable: Awaitable[object]) -> None:
     """Finish a required cleanup operation despite repeated cancellation delivery."""
 
-    await _await_result_deferring_cancellation(awaitable)
+    await _shared_await_cleanup_deferring_cancellation(awaitable)
 
 
 async def _rate_limit_headers_with_reservation_cleanup(
