@@ -427,12 +427,14 @@ class DurableBridgeSessionCoordinator:
         session_id: str,
         instance_id: str,
         owner_epoch: int,
+        expected_continuity: tuple[str | None, str | None] | None = None,
     ) -> DurableBridgeLookup | None:
         async with self._session() as session:
             snapshot = await DurableBridgeRepository(session).clear_latest_response_anchor(
                 session_id=session_id,
                 instance_id=instance_id,
                 owner_epoch=owner_epoch,
+                expected_continuity=expected_continuity,
             )
         if snapshot is None:
             return None
