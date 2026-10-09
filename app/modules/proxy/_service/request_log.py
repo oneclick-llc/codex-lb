@@ -7,9 +7,10 @@ from typing import Protocol, cast
 
 import anyio
 
-from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, proxy_phase_latency_seconds
+from app.core.metrics.prometheus import PROMETHEUS_AVAILABLE, proxy_phase_latency_seconds, upstream_requests_total
 from app.modules.api_keys.service import ApiKeyData
 from app.modules.proxy.affinity import _extract_model_class
+from app.modules.proxy.helpers import _QUOTA_CODES, _RATE_LIMIT_CODES, _TRANSIENT_CODES
 from app.modules.proxy.repo_bundle import ProxyRepoFactory
 
 logger = logging.getLogger("app.modules.proxy.service")
@@ -57,6 +58,58 @@ def _record_proxy_phase_latency(
         upstream_transport=upstream_transport or "unknown",
         model_class=_extract_model_class(model) if model else "unknown",
     ).observe(latency_ms / 1000.0)
+
+
+# Upstream error codes are free text, so only known codes become label values
+# and the rest are folded into "other" to keep the label set bounded.
+_KNOWN_OUTCOMES = (
+    _RATE_LIMIT_CODES
+    | _QUOTA_CODES
+    | _TRANSIENT_CODES
+    | frozenset(
+        {
+            "error",
+            "cancelled",
+            "context_length_exceeded",
+            "invalid_request_error",
+            "auth_error",
+            "authentication_error",
+            "invalid_api_key",
+            "invalid_authentication",
+            "token_invalidated",
+            "forbidden",
+            "upstream_unavailable",
+            "upstream_request_timeout",
+            "upstream_proxy_unavailable",
+            "upstream_keepalive_timeout",
+            "upstream_websocket_handshake_rejected",
+            "stream_idle_timeout",
+            "stream_event_too_large",
+            "client_disconnected",
+            "no_accounts",
+            "no_available_accounts",
+            "account_not_active",
+            "previous_response_not_found",
+            "previous_response_owner_unavailable",
+            "bridge_previous_response_not_found",
+            "continuity_owner_conflict",
+            "continuity_owner_policy_conflict",
+        }
+    )
+)
+
+
+def _record_upstream_outcome(account_id: str | None, status: str, error_code: str | None) -> None:
+    """Count one finished proxy request per account: success or its error code."""
+    if account_id is None or not PROMETHEUS_AVAILABLE or upstream_requests_total is None:
+        return
+    if status == "success":
+        outcome = "success"
+    else:
+        outcome = error_code or status
+        if outcome not in _KNOWN_OUTCOMES:
+            outcome = "other"
+    upstream_requests_total.labels(account_id=account_id, status=outcome).inc()
 
 
 class _RequestLogServiceProtocol(Protocol):
@@ -197,6 +250,7 @@ class _RequestLogMixin:
         client_ip: str | None = None,
         archive_request_id: str | None = None,
     ) -> None:
+        _record_upstream_outcome(account_id, status, upstream_error_code or error_code)
         task = asyncio.create_task(
             self._persist_request_log(
                 account_id=account_id,
