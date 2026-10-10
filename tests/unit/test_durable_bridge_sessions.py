@@ -1784,6 +1784,157 @@ async def test_durable_bridge_clear_response_anchor_is_noop_after_epoch_advance(
     assert stale_clear.latest_response_id == "resp_2"
 
 
+async def _claim_with_anchor(
+    coordinator: DurableBridgeSessionCoordinator,
+    key: str,
+    *,
+    turn_state: str | None,
+    response_id: str,
+) -> DurableBridgeLookup:
+    claimed = await coordinator.claim_live_session(
+        session_key_kind="session_header",
+        session_key_value=key,
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_process_epoch="test-process",
+        lease_ttl_seconds=60.0,
+        account_id="acc-1",
+        model="gpt-5.6-sol",
+        service_tier=None,
+        latest_turn_state=turn_state,
+        latest_response_id=None,
+        allow_takeover=True,
+    )
+    if turn_state is not None:
+        await coordinator.register_turn_state(
+            session_id=claimed.session_id,
+            api_key_id="key-1",
+            instance_id="instance-a",
+            owner_epoch=claimed.owner_epoch,
+            turn_state=turn_state,
+            lease_ttl_seconds=60.0,
+        )
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id=response_id,
+        lease_ttl_seconds=60.0,
+    )
+    return claimed
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_fenced_anchor_clear_applies_when_continuity_is_unchanged(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await _claim_with_anchor(coordinator, "sid-fenced-match", turn_state="ts-1", response_id="resp_dead")
+
+    cleared = await coordinator.clear_live_session_response_anchor(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        expected_continuity=("resp_dead", "ts-1"),
+    )
+
+    assert cleared is not None
+    assert cleared.latest_response_id is None
+    assert cleared.latest_turn_state == "ts-1"
+    by_turn_state = await coordinator.lookup_request_targets(
+        session_key_kind="session_header",
+        session_key_value="sid-fenced-match",
+        api_key_id="key-1",
+        turn_state="ts-1",
+        session_header=None,
+        previous_response_id=None,
+    )
+    assert by_turn_state is not None
+    assert by_turn_state.session_id == claimed.session_id
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_fenced_anchor_clear_keeps_a_fresh_response_anchor(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await _claim_with_anchor(coordinator, "sid-fenced-fresh", turn_state="ts-1", response_id="resp_dead")
+    # A concurrent completion lands a fresh anchor after the failed turn observed the dead one.
+    await coordinator.register_previous_response_id(
+        session_id=claimed.session_id,
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        response_id="resp_fresh",
+        lease_ttl_seconds=60.0,
+    )
+
+    result = await coordinator.clear_live_session_response_anchor(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        expected_continuity=("resp_dead", "ts-1"),
+    )
+
+    assert result is not None
+    assert result.latest_response_id == "resp_fresh"
+    assert result.latest_turn_state == "ts-1"
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_fenced_anchor_clear_keeps_anchor_when_only_turn_state_moved(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await _claim_with_anchor(coordinator, "sid-fenced-turn", turn_state="ts-1", response_id="resp_dead")
+    await coordinator.register_turn_state(
+        session_id=claimed.session_id,
+        api_key_id="key-1",
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        turn_state="ts-2",
+        lease_ttl_seconds=60.0,
+    )
+
+    result = await coordinator.clear_live_session_response_anchor(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        expected_continuity=("resp_dead", "ts-1"),
+    )
+
+    assert result is not None
+    assert result.latest_response_id == "resp_dead"
+    assert result.latest_turn_state == "ts-2"
+    for turn_state in ("ts-1", "ts-2"):
+        lookup = await coordinator.lookup_request_targets(
+            session_key_kind="session_header",
+            session_key_value="sid-fenced-turn",
+            api_key_id="key-1",
+            turn_state=turn_state,
+            session_header=None,
+            previous_response_id=None,
+        )
+        assert lookup is not None
+        assert lookup.session_id == claimed.session_id
+
+
+@pytest.mark.asyncio
+async def test_durable_bridge_fenced_anchor_clear_matches_a_missing_turn_state(
+    coordinator: DurableBridgeSessionCoordinator,
+) -> None:
+    claimed = await _claim_with_anchor(coordinator, "sid-fenced-null", turn_state=None, response_id="resp_dead")
+
+    cleared = await coordinator.clear_live_session_response_anchor(
+        session_id=claimed.session_id,
+        instance_id="instance-a",
+        owner_epoch=claimed.owner_epoch,
+        expected_continuity=("resp_dead", None),
+    )
+
+    assert cleared is not None
+    assert cleared.latest_response_id is None
+    assert cleared.latest_turn_state is None
+
+
 @pytest.mark.asyncio
 async def test_durable_bridge_claim_takes_over_after_release(
     coordinator: DurableBridgeSessionCoordinator,

@@ -9,7 +9,7 @@ from enum import StrEnum
 from hashlib import sha256
 from typing import Any, cast
 
-from sqlalchemy import Row, and_, case, delete, exists, func, or_, select, text, true, update
+from sqlalchemy import ColumnElement, Row, and_, case, delete, exists, func, or_, select, text, true, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.dialects.sqlite import insert as sqlite_insert
 from sqlalchemy.exc import IntegrityError
@@ -986,6 +986,7 @@ class DurableBridgeRepository:
         session_id: str,
         instance_id: str,
         owner_epoch: int,
+        expected_continuity: tuple[str | None, str | None] | None = None,
     ) -> DurableBridgeSessionSnapshot | None:
         """Invalidate a stuck eventless anchor with a single fenced UPDATE.
 
@@ -994,6 +995,11 @@ class DurableBridgeRepository:
         ``latest_turn_state`` and aliases untouched so the durable session
         remains reattachable without the stale anchor. Fenced-out callers
         mutate nothing and receive the current owner snapshot.
+
+        ``expected_continuity`` is the ``(latest_response_id,
+        latest_turn_state)`` pair the caller observed; when given, the row is
+        cleared only if both still hold, so a concurrent completion or turn
+        keeps its fresh continuity.
         """
 
         values: dict[str, object] = {
@@ -1002,11 +1008,18 @@ class DurableBridgeRepository:
             "latest_input_full_fingerprint": None,
             "latest_pending_tool_calls_json": None,
         }
+        conditions: list[ColumnElement[bool]] = []
+        if expected_continuity is not None:
+            expected_response_id, expected_turn_state = expected_continuity
+            # ``column == None`` compiles to ``IS NULL`` on SQLite and PostgreSQL.
+            conditions.append(HttpBridgeSessionRecord.latest_response_id == expected_response_id)
+            conditions.append(HttpBridgeSessionRecord.latest_turn_state == expected_turn_state)
         return await self._execute_fenced_session_update(
             session_id=session_id,
             instance_id=instance_id,
             owner_epoch=owner_epoch,
             values=values,
+            extra_conditions=conditions,
         )
 
     async def record_recovery_attempt(
@@ -2222,6 +2235,7 @@ class DurableBridgeRepository:
         instance_id: str,
         owner_epoch: int,
         values: dict[str, object],
+        extra_conditions: Sequence[ColumnElement[bool]] = (),
     ) -> DurableBridgeSessionSnapshot | None:
         async with sqlite_writer_section():
             result = await self._session.execute(
@@ -2230,6 +2244,7 @@ class DurableBridgeRepository:
                     HttpBridgeSessionRecord.id == session_id,
                     HttpBridgeSessionRecord.owner_instance_id == instance_id,
                     HttpBridgeSessionRecord.owner_epoch == owner_epoch,
+                    *extra_conditions,
                 )
                 .values(**values)
                 .returning(*_SNAPSHOT_COLUMNS)

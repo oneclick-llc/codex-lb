@@ -1048,6 +1048,12 @@ class _WebSocketRequestState:
     verified_stale_anchor_retry_circuit_key: _HTTPBridgeSessionKey | None = None
     verified_stale_anchor_retry_circuit_generation: tuple[int, float, int, float, int, float, float] | None = None
     verified_stale_anchor_quarantine_generation: int | None = None
+    # True while the submit owns an admission-waiter registration taken at
+    # submit entry, before the retry-circuit gate, that the dispatch path has
+    # not yet taken over. It keeps the turn visible to a concurrent
+    # cooldown-suppressed sibling deciding whether the shared session is
+    # idle; every pre-dispatch exit releases it.
+    admission_waiter_preregistered: bool = False
     # Stable fingerprint used by the durable recovery-attempt journal. It is
     # populated only for a proof-gated fresh replay candidate.
     recovery_attempt_fingerprint: str | None = None

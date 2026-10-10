@@ -49,6 +49,7 @@ from app.core.types import JsonValue
 from app.core.usage.live_hub import publish_live_usage
 from app.core.usage.live_snapshots import EVENT_MARKER, parse_rate_limit_event_text
 from app.core.utils.request_id import reset_request_id, set_request_id
+from app.core.utils.shared_future import _await_cleanup_deferring_cancellation
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.db.models import Account
 from app.modules.proxy._service.api_key_usage import (
@@ -966,40 +967,100 @@ async def _cancel_http_bridge_reader_child(
 async def _clear_durable_http_bridge_response_anchor(
     service: Any,
     session: "_HTTPBridgeSession",
-) -> None:
-    """Invalidate a durable proxy-injected anchor that proved eventless.
+    *,
+    detail: str = _HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
+    expected_continuity: tuple[str | None, str | None] | None = None,
+) -> bool:
+    """Invalidate a durable proxy-injected anchor that proved eventless or was rejected.
 
     Runs while ``session`` still owns the durable row (before retirement
     releases the lease), so the fenced write lands under the session's own
     owner epoch instead of silently losing the fence to a released owner.
+    ``expected_continuity`` additionally fences the write on the
+    ``(latest_response_id, latest_turn_state)`` pair the caller observed.
+    Returns whether the anchor was actually cleared.
     """
     if session.durable_session_id is None or session.durable_owner_epoch is None:
-        return
+        return False
     try:
         lookup = await service._durable_bridge.clear_live_session_response_anchor(
             session_id=session.durable_session_id,
             instance_id=_service_get_settings().http_responses_session_bridge_instance_id,
             owner_epoch=session.durable_owner_epoch,
+            **({} if expected_continuity is None else {"expected_continuity": expected_continuity}),
         )
     except Exception:
-        logger.warning("Failed to clear durable HTTP bridge response anchor after stuck timeout", exc_info=True)
-        return
+        logger.warning("Failed to clear durable HTTP bridge response anchor detail=%s", detail, exc_info=True)
+        return False
     if lookup is None or lookup.owner_epoch != session.durable_owner_epoch or lookup.latest_response_id is not None:
         # None means the durable row is gone entirely (e.g. purged); an
         # epoch or anchor mismatch means a newer owner already claimed the
-        # session before this fenced write executed. Either way, the anchor
-        # was never actually cleared, so do not report an invalidation that
-        # did not happen.
-        return
+        # session, or a fresh anchor landed, before this fenced write
+        # executed. Either way, the anchor was never actually cleared, so do
+        # not report an invalidation that did not happen.
+        return False
     _log_http_bridge_event(
         "durable_anchor_invalidated",
         session.key,
         account_id=session.account.id,
         model=session.request_model,
-        detail=_HTTP_BRIDGE_MISSING_RESPONSE_CREATED_TIMEOUT_DETAIL,
+        detail=detail,
         cache_key_family=session.key.affinity_kind,
         model_class=_extract_model_class(session.request_model) if session.request_model else None,
     )
+    return True
+
+
+async def _settle_rejected_http_bridge_anchor(
+    service: Any,
+    session: "_HTTPBridgeSession",
+    request_state: _WebSocketRequestState,
+) -> None:
+    """Settle a proxy-injected anchor that upstream rejected as not found.
+
+    Without this the terminal ``previous_response_not_found`` records no
+    retry-circuit strike, so a half-open probe keeps its lease and every
+    retry is suppressed until the lease expires, after which the next probe
+    injects the same dead anchor again. Record the strike, then drop the
+    anchor with a write fenced on the continuity observed before the strike,
+    and close the circuit once that clear is confirmed so the next request
+    goes out without the anchor.
+    """
+    anchor = request_state.previous_response_id
+    # Same boundary as the eventless clear: a delta-only payload has no other
+    # way to convey prior context, so it keeps failing closed.
+    drop_anchor = request_state.proxy_injected_anchor_had_full_resend_payload
+    observed = None
+    if drop_anchor and session.durable_session_id is not None:
+        try:
+            lookups = await service._durable_bridge.lookup_sessions(session_ids=[session.durable_session_id])
+        except Exception:
+            logger.warning("Failed to read durable HTTP bridge continuity before anchor clear", exc_info=True)
+            # The durable row may still hold the anchor, so keep the live copy
+            # too: a session that drops it while the row keeps it sends the
+            # next turn without context. The next probe settles both.
+            drop_anchor = False
+        else:
+            observed = lookups[0] if lookups else None
+    await service._record_http_bridge_retry_circuit_failure(session, detail="stream_incomplete")
+    if not drop_anchor:
+        return
+    durable_cleared = False
+    if observed is not None and observed.latest_response_id == anchor:
+        durable_cleared = await _clear_durable_http_bridge_response_anchor(
+            service,
+            session,
+            detail="previous_response_not_found",
+            expected_continuity=(anchor, observed.latest_turn_state),
+        )
+        if not durable_cleared:
+            # The fenced clear lost a race and the row keeps the anchor; keep
+            # the live copy in step with it for the same reason.
+            return
+    if session.last_completed_response_id == anchor:
+        session.last_completed_response_id = None
+    if durable_cleared:
+        await service._clear_http_bridge_retry_circuit(session)
 
 
 async def _abandon_durable_http_bridge_continuity(
@@ -3014,6 +3075,25 @@ class _HTTPBridgeUpstreamEventsMixin:
                     retried = await self._retry_http_bridge_security_work_request(session, terminal_request_state)
                     if retried:
                         return
+
+        if (
+            is_previous_response_not_found_event
+            and terminal_request_state is not None
+            and terminal_request_state.proxy_injected_previous_response_id
+            and terminal_request_state.previous_response_id is not None
+            # A held safe replay is retried in band and settles the circuit itself.
+            and not (
+                terminal_request_state.fresh_upstream_request_is_retry_safe
+                and terminal_request_state.fresh_upstream_request_text
+            )
+        ):
+            # Shielded: a reader cancelled mid-settle would skip the strike and
+            # keep the 600 s half-open lease, which is the wedge this ends.
+            cancellation = await _await_cleanup_deferring_cancellation(
+                _settle_rejected_http_bridge_anchor(self, session, terminal_request_state)
+            )
+            if cancellation is not None:
+                raise cancellation
 
         matched_event_queue = (
             completed_event_queue

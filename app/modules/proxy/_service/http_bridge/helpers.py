@@ -12,9 +12,6 @@ from ipaddress import ip_address
 from typing import Any, Literal, Mapping, TypeVar, cast
 from urllib.parse import urlparse
 
-import anyio
-from anyio.lowlevel import checkpoint_if_cancelled
-
 from app.core import shutdown as shutdown_state
 from app.core.balancer.rendezvous_hash import select_node
 from app.core.clients.files import create_file as core_create_file  # noqa: F401
@@ -67,7 +64,7 @@ from app.core.openai.requests import (
 from app.core.resilience.overload import local_overload_error
 from app.core.types import JsonValue
 from app.core.utils.request_id import get_request_id
-from app.core.utils.shared_future import wait_on_shared_future
+from app.core.utils.shared_future import _await_task_deferring_cancellation, wait_on_shared_future
 from app.core.utils.sse import format_sse_event, parse_sse_data_json
 from app.core.utils.time import to_utc_naive, utcnow
 from app.db.models import (
@@ -214,39 +211,6 @@ T = TypeVar("T")
 _HTTP_BRIDGE_INFLIGHT_STARTED_AT_ATTR = "_codex_lb_started_at"
 _HTTP_BRIDGE_STALE_INFLIGHT_MIN_SECONDS = 120.0
 _HTTP_BRIDGE_STALE_INFLIGHT_TIMEOUT_MULTIPLIER = 6.0
-
-
-async def _await_task_deferring_cancellation(
-    task: asyncio.Task[T],
-) -> tuple[T, asyncio.CancelledError | None]:
-    """Finish critical cleanup while preserving the caller's cancellation."""
-
-    cancellation: asyncio.CancelledError | None = None
-    # The anyio shield keeps a level-cancelled Starlette scope from re-raising
-    # into every ``await``, which would otherwise busy-spin this loop until the
-    # owned task completes. ``wait_on_shared_future`` keeps the loop's waits
-    # off the task's done-callback list: Python 3.14's ``asyncio.shield``
-    # leaks a callback per cancelled wait, so re-shielding a task wedged on a
-    # lock grew 100k+ callbacks and O(n^2) remove scans in the 2026-08-30
-    # production event-loop livelock.
-    with anyio.CancelScope(shield=True):
-        while True:
-            try:
-                result = await wait_on_shared_future(task)
-                break
-            except asyncio.CancelledError as exc:
-                if task.cancelled():
-                    raise
-                cancellation = cancellation or exc
-    if cancellation is None:
-        # The shield also blocks the level cancellation this helper promises
-        # to surface. Probe for it without suspending so callers still get
-        # their cancellation marker after the owned task finished.
-        try:
-            await checkpoint_if_cancelled()
-        except asyncio.CancelledError as exc:
-            cancellation = exc
-    return result, cancellation
 
 
 @dataclass(frozen=True, slots=True)
