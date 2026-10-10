@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import hmac
 import json
@@ -55,6 +56,10 @@ HTTP_BRIDGE_RESERVATION_KEY_ID_HEADER = "x-codex-bridge-reservation-key-id"
 HTTP_BRIDGE_RESERVATION_MODEL_HEADER = "x-codex-bridge-reservation-model"
 HTTP_BRIDGE_AFFINITY_KIND_HEADER = "x-codex-bridge-affinity-kind"
 HTTP_BRIDGE_AFFINITY_KEY_HEADER = "x-codex-bridge-affinity-key"
+# Carries an affinity key that is not a safe raw header value, such as the
+# LF-prefixed internal Codex selection keys from affinity.py, as URL-safe
+# base64 of its UTF-8 bytes. Only one of the two affinity key headers is sent.
+HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER = "x-codex-bridge-affinity-key-b64"
 HTTP_BRIDGE_FILE_OWNER_HEADER = "x-codex-bridge-file-owner"
 HTTP_BRIDGE_ORIGINAL_UNANCHORED_HEADER = "x-codex-bridge-original-unanchored"
 HTTP_BRIDGE_SIGNATURE_VERSION_HEADER = "x-codex-bridge-signature-version"
@@ -141,13 +146,45 @@ def _reject_illegal_bridge_header_value(name: str, value: str | None) -> None:
     )
 
 
+def _affinity_key_is_raw_header_safe(key: str) -> bool:
+    # HTAB stays raw: aiohttp and the check above accept it inside a value and
+    # owners that predate the base64 header still read such keys unchanged.
+    # Edge whitespace does not, because receivers strip header values.
+    return key == key.strip() and all(char == "\t" or " " <= char <= "~" for char in key)
+
+
+def _affinity_key_wire_header(key: str) -> tuple[str, str]:
+    """Return the header name and value that carry ``key`` to the owner."""
+
+    if _affinity_key_is_raw_header_safe(key):
+        return HTTP_BRIDGE_AFFINITY_KEY_HEADER, key
+    return HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER, base64.urlsafe_b64encode(key.encode("utf-8")).decode("ascii")
+
+
+def _decode_affinity_key_b64(value: str) -> str | None:
+    """Decode the base64 affinity key header, accepting only the canonical form."""
+
+    # No length cap of its own: the raw affinity key header has none either.
+    try:
+        raw = base64.b64decode(value, altchars=b"-_", validate=True)
+        key = raw.decode("utf-8")
+    except ValueError:
+        return None
+    # b64decode still accepts "+" and "/" next to the altchars and padding
+    # quirks; re-encoding pins the one canonical spelling the sender produces.
+    if base64.urlsafe_b64encode(raw).decode("ascii") != value:
+        return None
+    return key or None
+
+
 def _validate_bridge_forward_context_headers(context: HTTPBridgeForwardContext) -> None:
+    # The original affinity key is not listed: _affinity_key_wire_header always
+    # turns it into a safe header value, raw or base64.
     for name, value in (
         (HTTP_BRIDGE_ORIGIN_INSTANCE_HEADER, context.origin_instance),
         (HTTP_BRIDGE_TARGET_INSTANCE_HEADER, context.target_instance),
         ("x-codex-turn-state", context.downstream_turn_state),
         (HTTP_BRIDGE_AFFINITY_KIND_HEADER, context.original_affinity_kind),
-        (HTTP_BRIDGE_AFFINITY_KEY_HEADER, context.original_affinity_key),
         (HTTP_BRIDGE_FILE_OWNER_HEADER, context.file_owner_account_id),
         (HTTP_BRIDGE_CLIENT_IP_HEADER, context.client_ip),
     ):
@@ -312,7 +349,8 @@ def build_owner_forward_headers(
         forwarded[HTTP_BRIDGE_ORIGINAL_UNANCHORED_HEADER] = "1"
     if context.original_affinity_kind and context.original_affinity_key:
         forwarded[HTTP_BRIDGE_AFFINITY_KIND_HEADER] = context.original_affinity_kind
-        forwarded[HTTP_BRIDGE_AFFINITY_KEY_HEADER] = context.original_affinity_key
+        affinity_key_name, affinity_key_value = _affinity_key_wire_header(context.original_affinity_key)
+        forwarded[affinity_key_name] = affinity_key_value
     if context.file_owner_account_id:
         # This proof is accepted only with the full-context signature below;
         # the legacy primary signature intentionally remains byte-compatible.
@@ -392,6 +430,16 @@ def parse_forwarded_request(
         original_request_unanchored = False
     else:
         return None, _invalid_bridge_forward_signature_error()
+    original_affinity_key, affinity_key_valid = _forwarded_affinity_key(headers)
+    if not affinity_key_valid:
+        return None, ProxyResponseError(
+            400,
+            openai_error(
+                "bridge_forward_invalid",
+                "Internal bridge forward affinity key is invalid",
+                error_type="invalid_request_error",
+            ),
+        )
     context = HTTPBridgeForwardContext(
         origin_instance=headers.get(HTTP_BRIDGE_ORIGIN_INSTANCE_HEADER, "").strip() or "unknown",
         target_instance=target_instance,
@@ -399,7 +447,7 @@ def parse_forwarded_request(
         downstream_turn_state=_optional_header(headers.get("x-codex-turn-state")),
         original_request_unanchored=original_request_unanchored,
         original_affinity_kind=_optional_header(headers.get(HTTP_BRIDGE_AFFINITY_KIND_HEADER)),
-        original_affinity_key=_optional_header(headers.get(HTTP_BRIDGE_AFFINITY_KEY_HEADER)),
+        original_affinity_key=original_affinity_key,
         file_owner_account_id=_optional_header(headers.get(HTTP_BRIDGE_FILE_OWNER_HEADER)),
         client_ip=client_ip,
         reservation=_reservation_from_headers(headers),
@@ -472,6 +520,25 @@ def parse_forwarded_request(
     if not signature_valid:
         return None, _invalid_bridge_forward_signature_error()
     return HTTPBridgeForwardedRequest(context=context), None
+
+
+def _forwarded_affinity_key(headers: Mapping[str, str]) -> tuple[str | None, bool]:
+    """Return the original affinity key of a forward and whether its headers are well formed."""
+
+    getlist = getattr(headers, "getlist", None)
+    encoded_values: list[str] = (
+        list(getlist(HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER))
+        if callable(getlist)
+        else [value for key, value in headers.items() if key.lower() == HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER]
+    )
+    if not encoded_values:
+        return _optional_header(headers.get(HTTP_BRIDGE_AFFINITY_KEY_HEADER)), True
+    if len(encoded_values) > 1 or headers.get(HTTP_BRIDGE_AFFINITY_KEY_HEADER) is not None:
+        return None, False
+    # The decoded key is used byte for byte: _optional_header would strip the
+    # leading LF of the internal selection keys and break the signatures.
+    key = _decode_affinity_key_b64(encoded_values[0])
+    return key, key is not None
 
 
 def _invalid_bridge_forward_signature_error() -> ProxyResponseError:

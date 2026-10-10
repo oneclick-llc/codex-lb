@@ -15006,14 +15006,16 @@ def test_owner_forward_headers_allow_htab_in_signed_metadata_values() -> None:
 
 
 def test_owner_forward_headers_reject_illegal_control_char_affinity_metadata() -> None:
+    # The affinity key itself travels as base64 when it is not a safe raw
+    # value (see test_http_bridge_forwarding.py); the kind has no such channel.
     payload = proxy_service.ResponsesRequest.model_validate({"model": "gpt-5.4", "instructions": "hi", "input": "hi"})
     context = proxy_service.HTTPBridgeForwardContext(
         origin_instance="instance-a",
         target_instance="instance-b",
         codex_session_affinity=False,
         downstream_turn_state=None,
-        original_affinity_kind="prompt_cache",
-        original_affinity_key="cache\x00key",
+        original_affinity_kind="prompt\x00cache",
+        original_affinity_key="cache-key",
     )
 
     with pytest.raises(ProxyResponseError) as exc_info:

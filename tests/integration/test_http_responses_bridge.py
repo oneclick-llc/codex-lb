@@ -5046,6 +5046,113 @@ async def test_forwarded_priority_prompt_cache_mismatch_forks_on_canonical_owner
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("unanchored", [False, True], ids=["legacy-signature", "v2-signature"])
+async def test_forwarded_thread_selection_key_reaches_owner_session_byte_for_byte(
+    async_client,
+    app_instance,
+    monkeypatch,
+    unanchored: bool,
+):
+    from app.modules.proxy import api as proxy_api_module
+    from app.modules.proxy.affinity import _CodexBackendIdentity
+    from app.modules.proxy.http_bridge_forwarding import (
+        HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER,
+        HTTP_BRIDGE_AFFINITY_KEY_HEADER,
+        HTTPBridgeForwardContext,
+        build_owner_forward_headers,
+    )
+
+    owner_settings = _make_app_settings(
+        enabled=True,
+        instance_id="instance-a",
+        instance_ring=["instance-a", "instance-b"],
+    )
+    _install_proxy_settings(
+        monkeypatch,
+        app_settings=owner_settings,
+        dashboard_settings=_make_dashboard_settings(),
+    )
+    monkeypatch.setattr(proxy_api_module, "get_settings", lambda: owner_settings)
+    account_id = await _import_account(
+        async_client,
+        "acc_http_bridge_forwarded_thread_key",
+        "http-bridge-forwarded-thread-key@example.com",
+    )
+    account = await _get_account(account_id)
+    service = get_proxy_service_for_app(app_instance)
+
+    async def fake_select_account_with_budget(self, deadline, **kwargs):
+        del self, deadline, kwargs
+        return AccountSelection(account=account, error_message=None, error_code=None)
+
+    async def fake_ensure_fresh_with_budget(self, target, *, force=False, timeout_seconds):
+        del self, force, timeout_seconds
+        return target
+
+    async def fake_connect_responses_websocket(headers, access_token, account_id_header, **kwargs):
+        del headers, access_token, account_id_header, kwargs
+        return _FakeBridgeUpstreamWebSocket()
+
+    class Ring:
+        async def list_active(self, *, require_endpoint: bool = False) -> list[str]:
+            assert require_endpoint is True
+            return ["instance-a", "instance-b"]
+
+        async def resolve_endpoint(self, instance_id: str) -> str:
+            return f"http://{instance_id}"
+
+    monkeypatch.setattr(proxy_module.ProxyService, "_select_account_with_budget", fake_select_account_with_budget)
+    monkeypatch.setattr(proxy_module.ProxyService, "_ensure_fresh_with_budget", fake_ensure_fresh_with_budget)
+    monkeypatch.setattr(proxy_module, "connect_responses_websocket", fake_connect_responses_websocket)
+
+    ring = cast(Any, Ring())
+    original_ring = service._ring_membership
+    service._ring_membership = ring
+    # No other test sends an LF-prefixed thread selection key through the owner
+    # route: pick a real one that this instance owns.
+    session_key = None
+    for index in range(64):
+        thread_key = _CodexBackendIdentity(process_session=None, thread_id=f"thread-{index}").thread_selection_key
+        assert thread_key is not None and thread_key.startswith("\n")
+        candidate = proxy_module._HTTPBridgeSessionKey("thread_header", thread_key, None)
+        if await proxy_module._http_bridge_owner_instance(candidate, owner_settings, ring) == "instance-a":
+            session_key = candidate
+            break
+    assert session_key is not None
+    payload = proxy_module.ResponsesRequest.model_validate(
+        {"model": "gpt-5.4", "instructions": "Return exactly OK.", "input": "hello"}
+    )
+    forward_headers = build_owner_forward_headers(
+        headers={"x-request-id": "forwarded-thread-request"},
+        payload=payload,
+        context=HTTPBridgeForwardContext(
+            origin_instance="instance-b",
+            target_instance="instance-a",
+            codex_session_affinity=True,
+            downstream_turn_state=None,
+            original_request_unanchored=unanchored,
+            original_affinity_kind=session_key.affinity_kind,
+            original_affinity_key=session_key.affinity_key,
+        ),
+    )
+    assert HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER in forward_headers
+    assert HTTP_BRIDGE_AFFINITY_KEY_HEADER not in forward_headers
+
+    try:
+        response = await async_client.post(
+            "/internal/bridge/responses",
+            json=payload.model_dump_for_forwarding(),
+            headers=forward_headers,
+        )
+
+        assert response.status_code == 200, response.text
+        assert '"type":"response.completed"' in response.text
+        assert session_key in service._http_bridge_sessions
+    finally:
+        service._ring_membership = original_ring
+
+
+@pytest.mark.asyncio
 async def test_forwarded_recovery_uses_durable_owner_and_strips_stale_affinity(
     async_client,
     app_instance,
