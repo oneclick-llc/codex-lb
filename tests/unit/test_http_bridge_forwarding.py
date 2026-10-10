@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator, Iterator
+import base64
+import re
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -9,11 +11,15 @@ from typing import cast
 import aiohttp
 import pytest
 from aiohttp.client_reqrep import ConnectionKey
+from starlette.datastructures import Headers
 
+from app.core.clients.proxy import ProxyResponseError
 from app.core.config.settings import get_settings
 from app.core.openai.requests import ResponsesRequest
 from app.modules.api_keys.service import ApiKeyUsageReservationData
+from app.modules.proxy.affinity import _CODEX_SELECTION_KEY_PREFIX
 from app.modules.proxy.http_bridge_forwarding import (
+    HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER,
     HTTP_BRIDGE_AFFINITY_KEY_HEADER,
     HTTP_BRIDGE_AFFINITY_KIND_HEADER,
     HTTP_BRIDGE_CLIENT_IP_HEADER,
@@ -660,6 +666,151 @@ def test_build_owner_forward_headers_preserves_original_affinity_key() -> None:
 
     assert headers[HTTP_BRIDGE_AFFINITY_KIND_HEADER] == "session_header"
     assert headers[HTTP_BRIDGE_AFFINITY_KEY_HEADER] == "sid-123"
+
+
+_THREAD_SELECTION_KEY = f"{_CODEX_SELECTION_KEY_PREFIX}:thread_header:scope-1:{'ab' * 32}"
+
+
+def _affinity_context(key: str, *, unanchored: bool = False) -> HTTPBridgeForwardContext:
+    return HTTPBridgeForwardContext(
+        origin_instance="instance-a",
+        target_instance="instance-b",
+        codex_session_affinity=True,
+        downstream_turn_state="http_turn_123",
+        original_request_unanchored=unanchored,
+        original_affinity_kind="thread_header",
+        original_affinity_key=key,
+    )
+
+
+@pytest.mark.parametrize(
+    ("key", "expected_header"),
+    [
+        ("sid-123", HTTP_BRIDGE_AFFINITY_KEY_HEADER),
+        ("sid\t123", HTTP_BRIDGE_AFFINITY_KEY_HEADER),
+        (_THREAD_SELECTION_KEY, HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER),
+        (" sid-123", HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER),
+        ("sid-123\t", HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER),
+        ("cache\x00key", HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER),
+        ("ключ", HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER),
+        ("\n" + "k" * 1600, HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER),
+    ],
+)
+@pytest.mark.parametrize("unanchored", [False, True])
+def test_affinity_key_round_trips_byte_for_byte(key: str, expected_header: str, unanchored: bool) -> None:
+    payload = _payload()
+    context = _affinity_context(key, unanchored=unanchored)
+
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=context)
+
+    other_header = (
+        HTTP_BRIDGE_AFFINITY_KEY_HEADER
+        if expected_header == HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER
+        else HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER
+    )
+    assert expected_header in headers
+    assert other_header not in headers
+    # Every value must be writable by aiohttp, which rejects these characters.
+    assert not any(re.search(r"[\x00-\x08\x0a-\x1f\x7f]", value) for value in headers.values())
+    for legacy in (False, True):
+        sent = dict(headers)
+        if legacy:
+            _use_legacy_forward_signature(sent, payload=payload, context=context)
+        forwarded, error = parse_forwarded_request(sent, payload=payload, current_instance="instance-b")
+        assert error is None
+        assert forwarded is not None
+        assert forwarded.context.original_affinity_key == key
+
+
+def test_parse_forwarded_request_rejects_swapped_base64_affinity_key() -> None:
+    payload = _payload()
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=_affinity_context(_THREAD_SELECTION_KEY))
+    other_key = _THREAD_SELECTION_KEY.replace("scope-1", "scope-2")
+    headers[HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER] = base64.urlsafe_b64encode(other_key.encode()).decode()
+
+    forwarded, error = parse_forwarded_request(headers, payload=payload, current_instance="instance-b")
+
+    assert forwarded is None
+    assert error is not None
+    assert error.status_code == 400
+    assert error.payload["error"]["message"] == "Internal bridge forward signature is invalid"
+
+
+def _canonical_b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode()
+
+
+def _assert_affinity_key_rejected(forwarded: object, error: object) -> None:
+    # The dedicated message proves the decoder rejected the header, not the
+    # signature check behind it.
+    assert forwarded is None
+    assert isinstance(error, ProxyResponseError)
+    assert error.status_code == 400
+    assert error.payload["error"]["code"] == "bridge_forward_invalid"
+    assert error.payload["error"]["message"] == "Internal bridge forward affinity key is invalid"
+
+
+@pytest.mark.parametrize(
+    ("key", "respell"),
+    [
+        ("\n???", lambda canonical: canonical.replace("_", "/")),
+        ("\n???", lambda canonical: canonical.replace("Pw==", "Px==")),
+    ],
+    ids=["standard-alphabet", "nonzero-padding-bits"],
+)
+def test_parse_forwarded_request_rejects_non_canonical_spelling_of_the_signed_key(
+    key: str,
+    respell: Callable[[str], str],
+) -> None:
+    payload = _payload()
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=_affinity_context(key))
+    spelled = respell(headers[HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER])
+    # Same key bytes, so the signatures still match and only the decoder's
+    # canonical-form check can reject the forward.
+    assert base64.b64decode(spelled, altchars=b"-_") == key.encode()
+    headers[HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER] = spelled
+
+    forwarded, error = parse_forwarded_request(headers, payload=payload, current_instance="instance-b")
+
+    _assert_affinity_key_rejected(forwarded, error)
+
+
+@pytest.mark.parametrize(
+    "encoded",
+    [
+        _canonical_b64(b"ab").rstrip("="),
+        _canonical_b64(_THREAD_SELECTION_KEY.encode()) + "\t",
+        base64.b64encode(b"???key").decode(),
+        _canonical_b64(b"\xff\xfe"),
+        "!!!!",
+        "",
+    ],
+    ids=["no-padding", "trailing-tab", "standard-alphabet", "not-utf8", "bad-chars", "empty"],
+)
+def test_parse_forwarded_request_rejects_non_canonical_base64_affinity_key(encoded: str) -> None:
+    payload = _payload()
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=_affinity_context(_THREAD_SELECTION_KEY))
+    headers[HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER] = encoded
+
+    forwarded, error = parse_forwarded_request(headers, payload=payload, current_instance="instance-b")
+
+    _assert_affinity_key_rejected(forwarded, error)
+
+
+def test_parse_forwarded_request_rejects_ambiguous_affinity_key_headers() -> None:
+    payload = _payload()
+    headers = build_owner_forward_headers(headers={}, payload=payload, context=_affinity_context(_THREAD_SELECTION_KEY))
+    with_raw = dict(headers)
+    with_raw[HTTP_BRIDGE_AFFINITY_KEY_HEADER] = "sid-123"
+    encoded = headers[HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER]
+    duplicated = Headers(
+        raw=[(name.encode(), value.encode()) for name, value in headers.items()]
+        + [(HTTP_BRIDGE_AFFINITY_KEY_B64_HEADER.encode(), encoded.encode())]
+    )
+
+    for sent in (with_raw, duplicated):
+        forwarded, error = parse_forwarded_request(sent, payload=payload, current_instance="instance-b")
+        _assert_affinity_key_rejected(forwarded, error)
 
 
 def test_parse_forwarded_request_preserves_signed_original_unanchored_status() -> None:
